@@ -58,7 +58,17 @@ jobs:
             echo "::error::file-trace.sh failed"; tail -30 build/file-trace.log; exit 1
           fi
           python3 -I opcache-remote.py build/opcache.zip build/file-trace.json build/build-id.js
+          # #569 (#394 Gate 2): the site.zip read pattern and the simulated fetches per request, from
+          # the same trace (a measurement; site.zip is untouched by opcache-remote.py).
+          python3 -I site-trace-report.py build/site.zip build/file-trace.json build/opcache-remote-index.js
+          grep -E 'cold|warm' build/file-trace-admin.log || true
           if ! tests/remote-e2e.sh; then
             echo "::error::remote-e2e.sh failed; last lines of dev.log:"; tail -40 dev.log 2>/dev/null || true; exit 1
+          fi
+          # #569 (SITE_REMOTE): site.zip to packs as well (it empties site.zip, so it runs last), then the
+          # same three cases with the site served only from packs.
+          python3 -I site-remote.py build/site.zip build/file-trace.json build/build-id.js
+          if ! REMOTE_E2E_SITE=1 tests/remote-e2e.sh; then
+            echo "::error::remote-e2e.sh (site) failed; last lines of dev.log:"; tail -40 dev.log 2>/dev/null || true; exit 1
           fi
           echo "remote steps took $(( $(date +%s) - s )) s"

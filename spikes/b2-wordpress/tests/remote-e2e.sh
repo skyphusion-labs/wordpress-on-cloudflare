@@ -20,6 +20,17 @@ ID=$(python3 -c "import json,re; m=re.search(r'\{.*\}', open('build/opcache-remo
 [ -s "build/public/_pf/$ID/oc-0.zip" ] || { echo "FAIL build/public/_pf/$ID/oc-0.zip is missing"; exit 1; }
 [ "$(cat build/opcache-boot-index.js)" = "export default null;" ] || { echo "FAIL build/opcache-boot-index.js is not null: a remote build has no boot pack"; exit 1; }
 python3 -c "import zipfile,sys; sys.exit(0 if zipfile.ZipFile('build/opcache.zip').namelist() == [] else 1)" || { echo "FAIL build/opcache.zip is not empty on a remote build"; exit 1; }
+# REMOTE_E2E_SITE=1 (#569): the build ALSO ran site-remote.py, so site.zip is empty and every site file
+# comes from st-<n>.zip / site-hot.zip packs. Every case then also needs site fetches with no failure
+# and nothing capped (OPcache off or capped at 0 must not touch the site: its cap is the hard one).
+SITE=${REMOTE_E2E_SITE:-0}
+# REMOTE_E2E_SITE_HOLD=<KiB> (#569): every site case also runs with SITE_HOLD_KIB=<KiB>, to measure another
+# site held budget (a CEILING). The default, 8192, was chosen on pf570m (#570 issuecomment-6880689593).
+SITE_HOLD=${REMOTE_E2E_SITE_HOLD:-}
+if [ "$SITE" = 1 ]; then
+  python3 -c "import zipfile,sys; sys.exit(0 if zipfile.ZipFile('build/site.zip').namelist() == [] else 1)" || { echo "FAIL build/site.zip is not empty on a SITE_REMOTE build"; exit 1; }
+  [ -s "build/public/_pf/$ID/st-0.zip" ] || { echo "FAIL build/public/_pf/$ID/st-0.zip is missing"; exit 1; }
+fi
 bad=0
 ok() { if [ "$2" = 1 ]; then echo "PASS $1"; else echo "FAIL $1"; bad=1; fi; }
 STATE=""
@@ -30,21 +41,25 @@ perf_sum() {
   curl -s "${ST[@]}" -X POST -H "x-admin-password: $PW" "$B/_install" > /dev/null
   local f; f=$(mktemp)
   for u in "/?nocache=r$RANDOM" "/?post_type=product&nocache=r$RANDOM" "/wp-login.php" "/?rest_route=/wp/v2/types&nocache=r$RANDOM"; do
-    curl -s -D - -o /dev/null "${ST[@]}" "$B$u" | grep -i '^x-perf:' >> "$f"
+    curl -s -D - -o /dev/null "${ST[@]}" -H 'x-mem-ledger: 1' "$B$u" | grep -i '^x-perf:' >> "$f"
   done
   python3 - "$f" <<'PY'
 import json, sys
-s = {'rfN': 0, 'rfFail': 0, 'rfCapped': 0}; remote = None; n = 0; held = 0
+s = {'rfN': 0, 'rfFail': 0, 'rfCapped': 0, 'rsN': 0, 'rsFail': 0, 'rsRetry': 0, 'rsCapped': 0}; remote = None; n = 0; held = 0; site = None
 for line in open(sys.argv[1]):
     d = json.loads(line.split(': ', 1)[1]); n += 1
     for k in s: s[k] += int(d.get(k, 0))
-    if d.get('boot') == 1: remote = d.get('remote')
+    if d.get('boot') == 1: remote = d.get('remote'); site = d.get('siteRemote')
     held = max(held, int(d.get('rfHeldKiB', 0)))
     # Per page, for the fetch budget (#563): did it boot, how many packs, the held high-water.
-    print('page %d: boot=%s rt=%s rtServed=%s rfN=%s rfPacks=%s rfHeldKiB=%s' % (n, d.get('boot'), d.get('rt'), d.get('rtServed'), d.get('rfN'), d.get('rfPacks'), d.get('rfHeldKiB')), file=sys.stderr)
+    mem = d.get('mem') or {}
+    memfs = (mem.get('memfs') or {}).get('totalMiB') if isinstance(mem.get('memfs'), dict) else None
+    # MEMORY (#570, the lead): the wasm heap after the render (wasm1MiB), the ledger's MEMFS and inflated
+    # MiB, and the held packs. The headroom reach needs an enforced isolate limit: not on local workerd.
+    print('page %d: boot=%s rt=%s rtServed=%s rfN=%s rfPacks=%s rfHeldKiB=%s rsN=%s rsPacks=%s rsRetry=%s rsFail=%s rsHeldKiB=%s | wasm1MiB=%s ledgerWasmMiB=%s memfsMiB=%s inflatedMiB=%s' % (n, d.get('boot'), d.get('rt'), d.get('rtServed'), d.get('rfN'), d.get('rfPacks'), d.get('rfHeldKiB'), d.get('rsN'), d.get('rsPacks'), d.get('rsRetry'), d.get('rsFail'), d.get('rsHeldKiB'), d.get('wasm1MiB'), mem.get('wasmMiB'), memfs, mem.get('inflatedMiB')), file=sys.stderr)
 # The remote state has spaces ("packs 21 files 2128 cap 64 holdKiB 2048"): one token, so the
 # key=value line splits cleanly (a run of the first shape failed here on a correct reading).
-print('pages=%d rfN=%d rfFail=%d rfCapped=%d heldKiB=%d remote=%s' % (n, s['rfN'], s['rfFail'], s['rfCapped'], held, str(remote).replace(' ', '_')))
+print('pages=%d rfN=%d rfFail=%d rfCapped=%d heldKiB=%d rsN=%d rsFail=%d rsRetry=%d rsCapped=%d remote=%s site=%s' % (n, s['rfN'], s['rfFail'], s['rfCapped'], held, s['rsN'], s['rsFail'], s['rsRetry'], s['rsCapped'], str(remote).replace(' ', '_'), str(site).replace(' ', '_')))
 PY
   rm -f "$f"
 }
@@ -52,6 +67,7 @@ run_case() { # run_case <label> <DEV_VARS> <python test on the perf_sum line>
   local label=$1 vars=$2 want=$3
   ./run.sh --stop >/dev/null 2>&1; [ -n "$STATE" ] && rm -rf "$STATE"
   STATE=$(mktemp -d "${TMPDIR:-/tmp}/remote-e2e.XXXXXX"); export PERSIST_TO=$STATE
+  [ "$SITE" = 1 ] && [ -n "$SITE_HOLD" ] && vars="${vars:+$vars }SITE_HOLD_KIB:$SITE_HOLD"
   DEV_LOCAL=1 DEV_VARS="$vars" ./run.sh _ping > /dev/null || { echo "FAIL $label: wrangler dev did not start"; bad=1; return; }
   curl -s "${ST[@]}" -X POST -H "x-admin-password: $PW" "$B/_install" > /dev/null
   curl -s "${ST[@]}" -X POST -H "x-admin-password: $PW" "$B/_activate?plugin=woocommerce/woocommerce.php" > /dev/null
@@ -63,10 +79,13 @@ run_case() { # run_case <label> <DEV_VARS> <python test on the perf_sum line>
   ok "$label: $line" "$(python3 -c "
 import sys; d = dict(kv.split('=', 1) for kv in sys.argv[1].split())
 n = lambda k: int(d[k])
-print(1 if ($want) else 0)" "$line")"
+# #569: on a SITE_REMOTE build the boot self-check must have passed (siteRemote ends with selfcheck ok).
+site_ok = (n('rsN') > 0 and n('rsFail') == 0 and n('rsCapped') == 0 and d['site'].endswith('selfcheck_ok')) if sys.argv[2] == '1' else n('rsN') == 0
+print(1 if ($want) and site_ok else 0)" "$line" "$SITE")"
   local c1 c2
-  c1=$(curl -s -o /dev/null -w '%{http_code}' "$B/_pf/$ID/oc-0.zip")
-  c2=$(curl -s -o /dev/null -w '%{http_code}' "${ST[@]}" "$B/_pf/$ID/oc-0.zip")
+  local pk=oc-0.zip; [ "$SITE" = 1 ] && pk=st-0.zip
+  c1=$(curl -s -o /dev/null -w '%{http_code}' "$B/_pf/$ID/$pk")
+  c2=$(curl -s -o /dev/null -w '%{http_code}' "${ST[@]}" "$B/_pf/$ID/$pk")
   ok "$label: /_pf/ packs are never served (stranger $c1, with the spike token $c2)" "$([ "$c1" = 404 ] && [ "$c2" = 404 ] && echo 1 || echo 0)"
 }
 # The held budget is REMOTE_HOLD_KIB (default 4096) plus at most one pack over it (about 1.1 MiB).
@@ -78,5 +97,17 @@ run_case cap0 "REMOTE_FETCH_CAP:0" "n('pages') == 4 and n('rfN') == 0 and n('rfC
 for h in ${REMOTE_E2E_HOLDS:-}; do
   run_case "remote-hold$h" "REMOTE_HOLD_KIB:$h" "n('pages') == 4 and n('rfN') > 0 and n('rfFail') == 0 and n('rfCapped') == 0 and 0 < n('heldKiB') <= $h + 1200 and d['remote'].startswith('packs_')"
 done
-run_case off "OPCACHE_REMOTE:off" "n('pages') == 4 and n('rfN') == 0 and n('rfCapped') == 0 and d['remote'] == 'off'"
+if [ "$SITE" = 1 ]; then
+  # The lead's ruling on #570: OPcache OFF with SITE_REMOTE is refused at runtime, loudly: a 503 that
+  # names it, never a thrash (it cannot fit the fetch budget: every script compiles from source).
+  ./run.sh --stop >/dev/null 2>&1; [ -n "$STATE" ] && rm -rf "$STATE"
+  STATE=$(mktemp -d "${TMPDIR:-/tmp}/remote-e2e.XXXXXX"); export PERSIST_TO=$STATE
+  DEV_LOCAL=1 DEV_VARS="OPCACHE_REMOTE:off" ./run.sh _ping > /dev/null 2>&1 || true
+  r=$(curl -s -D - -o /dev/null "$B/?nocache=off$RANDOM" | tr -d '\r')
+  code=$(printf '%s\n' "$r" | head -1 | awk '{print $2}')
+  why=$(printf '%s\n' "$r" | grep -i '^x-site-remote-refused:' | awk '{print $2}')
+  ok "off: OPCACHE_REMOTE=off with SITE_REMOTE is REFUSED loudly (got $code, x-site-remote-refused: ${why:-none})" "$([ "$code" = 503 ] && [ "$why" = opcache-off ] && echo 1 || echo 0)"
+else
+  run_case off "OPCACHE_REMOTE:off" "n('pages') == 4 and n('rfN') == 0 and n('rfCapped') == 0 and d['remote'] == 'off'"
+fi
 exit $bad

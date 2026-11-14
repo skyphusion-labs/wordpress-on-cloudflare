@@ -32,6 +32,14 @@
 
 export const REMOTE_FETCH_CAP = 64;
 export const REMOTE_HOLD_BYTES = 4096 * 1024;
+// #569 (Gate 2): site opens may go on to this per-request HARD cap (0.96 % of the Paid 10,000). The
+// measured cold admin request is about 44 fetches in all (#394 issuecomment-6879197224).
+export const SITE_FETCH_CAP = 96;
+// #569: the site held budget, a CEILING (normal requests hold about 544 KiB). 2048 thrashed a compile
+// boot (OPcache unable to serve, so every source is read: 87 fetches, and the checkout hit the hard
+// cap). 8192 passed the cap (14 of 96), memory (a /_headroom reach of 108 MiB or more after a compile
+// boot, against the 32 MiB line) and normal requests, on pf570m (#570 issuecomment-6880689593, -6880882169).
+export const SITE_HOLD_BYTES = 8192 * 1024;
 
 async function sha256hex(bytes) {
 	const h = new Uint8Array(await crypto.subtle.digest('SHA-256', bytes));
@@ -40,29 +48,62 @@ async function sha256hex(bytes) {
 	return s;
 }
 
-// index: { id, packs: [{ name, bytes, sha256 }], files: { <name>: [packNo, size] } }
+// One request's subrequest budget, shared by the OPcache and the site packs (#569). OPcache opens
+// stop at the SOFT cap: past it, an OPcache file is a compile from source, free and correct. Site
+// opens may go on to the HARD cap: a site file that cannot be fetched is an honest 500, so site
+// needs the headroom. Each fetch, a retry included, takes one. reset() at the end of a request.
+export function createFetchBudget({ soft = REMOTE_FETCH_CAP, hard = SITE_FETCH_CAP } = {}) {
+	let n = 0;
+	return {
+		get n() { return n; },
+		soft,
+		hard,
+		take(limit) {
+			if (n >= (limit === 'hard' ? hard : soft)) return false;
+			n++;
+			return true;
+		},
+		reset() { n = 0; },
+	};
+}
+
+// index: { id, packs: [{ name, bytes, sha256 }], files: { <name>: [packNo, size] }, hot? }
+//   hot (site, #569): { name, bytes, sha256 }, the pack of the files with packNo -1. It is fetched
+//   once per runtime and held across requests, outside the LRU budget.
 // fetchPack(name) -> Promise<Uint8Array> (throws on a non-200); parse(bytes) -> zip entries
-// ({ name, data(out) }, index.js zipEntries); stats: the counters x-perf reads (rf*).
-export function createRemotePacks({ index, fetchPack, parse, stats, cap = REMOTE_FETCH_CAP, holdBytes = REMOTE_HOLD_BYTES, log = () => {} }) {
+// ({ name, data(out) }, index.js zipEntries); stats: the counters x-perf reads, named prefix + N,
+// Bytes, Ms, Fail, Capped, Retry ('rf' OPcache, 'rs' site).
+// budget/limit: a shared createFetchBudget and which cap this instance stops at. Without one, a
+//   budget of its own at `cap` (the #565 shape), reset by endRequest.
+// retries/retryDelayMs/sleep: a failed fetch is tried again `retries` times after a fixed delay
+//   (site: 1, so one transient ASSETS hiccup is not a 500). Each retry is counted, and needs budget.
+const realSleep = (ms) => new Promise((r) => setTimeout(r, ms));
+export function createRemotePacks({ index, fetchPack, parse, stats, cap = REMOTE_FETCH_CAP, holdBytes = REMOTE_HOLD_BYTES, log = () => {}, prefix = 'rf', budget = null, limit = 'soft', retries = 0, retryDelayMs = 50, sleep = realSleep }) {
 	// packNo -> Map(name -> entry), this request only. A Map keeps insertion order: the first key is
 	// the least recently used pack (touch() moves a pack to the end).
 	const held = new Map();
 	let heldBytes = 0;
 	let heldMax = 0;
 	let lastHeldMax = 0;
-	const distinct = new Set(); // packs fetched in this request: rfN minus this is the refetch (thrash) count
+	let hot = null; // the hot pack's Map(name -> entry), held for the life of this runtime
+	const distinct = new Set(); // packs fetched in this request: N minus this is the refetch (thrash) count
 	let lastDistinct = 0;
 	const pending = new Map(); // packNo -> promise of the fetch in flight, THIS request only
-	// #563 audit (the #568 class): every fetch is started by an open() of a live request and awaited
+	// #569 audit (the #568 class): every fetch is started by an open() of a live request and awaited
 	// by it, through the loader's Suspending import; nothing here runs in the background, so nothing
-	// needs waitUntil. But a request can END with a fetch in flight, and workerd may drop that promise
-	// so it never settles. epoch makes such a fetch harmless: endRequest() forgets it (the next
-	// request fetches again, never waits on it), and a late result is thrown away, never held.
+	// needs waitUntil. But a request can END with a fetch in flight (an exception, a dropped isolate
+	// task), and workerd may drop that promise so it never settles. epoch makes such a fetch harmless:
+	// endRequest() forgets it (the next request fetches again, never waits on it), and a late result
+	// of an ended request is thrown away, never held in the next one.
 	let epoch = 0;
 	const failed = new Set(); // packNo that failed in this request
-	let reqN = 0;
+	const own = !budget;
+	const bud = budget || createFetchBudget({ soft: cap, hard: cap });
+	const lim = budget ? limit : 'soft';
 	let cappedLogged = false;
-	for (const k of ['rfN', 'rfBytes', 'rfMs', 'rfFail', 'rfCapped']) if (typeof stats[k] !== 'number') stats[k] = 0;
+	const K = (s) => prefix + s;
+	for (const s of ['N', 'Bytes', 'Ms', 'Fail', 'Capped', 'Retry']) if (typeof stats[K(s)] !== 'number') stats[K(s)] = 0;
+	const packAt = (packNo) => (packNo === -1 ? index.hot : index.packs[packNo]);
 
 	function touch(packNo) {
 		const m = held.get(packNo);
@@ -70,6 +111,10 @@ export function createRemotePacks({ index, fetchPack, parse, stats, cap = REMOTE
 		held.set(packNo, m);
 	}
 	function hold(packNo, m, size) {
+		if (packNo === -1) {
+			hot = m;
+			return;
+		}
 		held.set(packNo, m);
 		heldBytes += size;
 		// Least recently used out first, but never the pack just fetched.
@@ -80,50 +125,70 @@ export function createRemotePacks({ index, fetchPack, parse, stats, cap = REMOTE
 		}
 		if (heldBytes > heldMax) heldMax = heldBytes;
 	}
+	function capped(pk) {
+		stats[K('Capped')]++;
+		if (!cappedLogged) log({ m: 'remote', kind: prefix, capped: lim === 'hard' ? bud.hard : bud.soft, pack: pk.name }); // once per request, loudly
+		cappedLogged = true;
+		return new Error('remote fetch cap ' + (lim === 'hard' ? bud.hard : bud.soft) + ' reached');
+	}
+	async function fetchChecked(pk) {
+		const bytes = await fetchPack(pk.name);
+		if (bytes.length !== pk.bytes) throw new Error(pk.name + ': ' + bytes.length + ' bytes, the index says ' + pk.bytes);
+		const h = await sha256hex(bytes);
+		if (h !== pk.sha256) throw new Error(pk.name + ': SHA-256 mismatch');
+		return bytes;
+	}
 	function load(packNo) {
-		if (held.has(packNo)) {
-			touch(packNo);
+		if (packNo === -1 ? hot !== null : held.has(packNo)) {
+			if (packNo !== -1) touch(packNo);
 			return null;
 		}
 		if (pending.has(packNo)) return pending.get(packNo);
-		if (failed.has(packNo)) return Promise.reject(new Error('pack ' + packNo + ' failed earlier in this request'));
-		if (reqN >= cap) {
-			stats.rfCapped++;
-			if (!cappedLogged) log({ m: 'remote', capped: cap, pack: index.packs[packNo].name }); // once per request, loudly
-			cappedLogged = true;
-			return Promise.reject(new Error('remote fetch cap ' + cap + ' reached'));
-		}
-		reqN++;
-		stats.rfN++;
+		const pk = packAt(packNo);
+		if (failed.has(packNo)) return Promise.reject(new Error(pk.name + ' failed earlier in this request'));
+		if (!bud.take(lim)) return Promise.reject(capped(pk));
+		stats[K('N')]++;
 		distinct.add(packNo);
-		const pk = index.packs[packNo];
 		const t = Date.now();
 		const mine = epoch;
 		const p = (async () => {
-			const bytes = await fetchPack(pk.name);
-			if (bytes.length !== pk.bytes) throw new Error(pk.name + ': ' + bytes.length + ' bytes, the index says ' + pk.bytes);
-			const h = await sha256hex(bytes);
-			if (h !== pk.sha256) throw new Error(pk.name + ': SHA-256 mismatch');
+			let bytes;
+			for (let attempt = 0; ; attempt++) {
+				try {
+					bytes = await fetchChecked(pk);
+					break;
+				} catch (e) {
+					if (attempt >= retries) throw e;
+					stats[K('Retry')]++;
+					log({ m: 'remote', kind: prefix, retry: String((e && e.message) || e).slice(0, 200) });
+					await sleep(retryDelayMs);
+					if (!bud.take(lim)) throw capped(pk);
+					stats[K('N')]++;
+				}
+			}
 			if (mine !== epoch) throw new Error(pk.name + ': its request ended before the fetch did');
 			const m = new Map();
 			for (const e of parse(bytes)) m.set(e.name, e);
 			hold(packNo, m, bytes.length);
-			stats.rfBytes += bytes.length;
+			stats[K('Bytes')] += bytes.length;
 		})().then(
 			() => {
-				stats.rfMs += Date.now() - t;
+				stats[K('Ms')] += Date.now() - t;
 				if (mine === epoch) pending.delete(packNo);
 			},
 			(e) => {
-				stats.rfMs += Date.now() - t;
+				stats[K('Ms')] += Date.now() - t;
 				if (mine !== epoch) throw e; // an ended request's fetch: no count, no mark on the next request
-				stats.rfFail++;
+				stats[K('Fail')]++;
 				failed.add(packNo);
 				pending.delete(packNo);
-				log({ m: 'remote', fail: String((e && e.message) || e).slice(0, 200) });
+				log({ m: 'remote', kind: prefix, fail: String((e && e.message) || e).slice(0, 200) });
 				throw e;
 			},
 		);
+		// A stale fetch (its request ended) rejects into a chain nobody awaits any more; mark it handled
+		// so it never logs as an unhandled rejection. Anyone who IS waiting still gets the rejection.
+		p.catch(() => {});
 		pending.set(packNo, p);
 		return p;
 	}
@@ -138,7 +203,7 @@ export function createRemotePacks({ index, fetchPack, parse, stats, cap = REMOTE
 		// The bytes of a remote file from its held pack, or null when the pack is not held.
 		data(name, out) {
 			const f = index.files[name];
-			const m = f === undefined ? null : held.get(f[0]);
+			const m = f === undefined ? null : f[0] === -1 ? hot : held.get(f[0]);
 			const e = m && m.get(name);
 			return e ? e.data(out) : null;
 		},
@@ -152,13 +217,56 @@ export function createRemotePacks({ index, fetchPack, parse, stats, cap = REMOTE
 			lastDistinct = distinct.size;
 			distinct.clear();
 			failed.clear();
-			reqN = 0;
+			if (own) bud.reset();
 			cappedLogged = false;
 		},
 		heldPacks: () => held.size,
-		// The high-water of held pack bytes in the request that ended last (x-perf rfHeldKiB).
+		// The high-water of held pack bytes in the request that ended last (x-perf rfHeldKiB), the hot
+		// pack not included (its fixed cost is index.hot.bytes).
 		lastHeldMax: () => lastHeldMax,
 		// Distinct packs fetched in the request that ended last (x-perf rfPacks).
 		lastDistinct: () => lastDistinct,
+		hotHeld: () => hot !== null,
 	};
+}
+
+// #569 (Gate 2, the HYBRID): the loader hooks for SITE files (site.zip names, no leading slash).
+// OPcache opens a .php source it then serves from its cache WITHOUT reading it (step 3, #394
+// issuecomment-6879862441: 37,721 of 37,721 opened-but-unread site files were .php), so:
+// - a .php is fetched at its FIRST READ (pagefeatherRead, prepare.sh PY6), and pinned from that read
+//   to its close;
+// - every other site file is fetched at its OPEN (pagefeatherOpen, PY5), and pinned from the open, so
+//   a failure stays a clean false (a failed READ makes @file_get_contents return "", Gate 0b).
+// The node gets pagefeatherName and pagefeatherPin from attachLazyContents (tag.pin 'read').
+export function createSiteHooks(remote, isPhp = (name) => name.endsWith('.php')) {
+	return {
+		pinMode: (name) => (isPhp(name) ? 'read' : 'open'),
+		// null: open now (not a site file, a .php, or its pack is held). A promise: wait for the pack.
+		open(path) {
+			const name = path.charCodeAt(0) === 47 ? path.slice(1) : path;
+			if (remote.files[name] === undefined || isPhp(name)) return null;
+			return remote.open(name);
+		},
+		read(stream) {
+			const node = stream && stream.node;
+			if (!node || typeof node.pagefeatherPin !== 'function' || stream.pfPinned) return null;
+			const p = remote.open(node.pagefeatherName);
+			if (!p) {
+				node.pagefeatherPin(stream); // throws EIO (an ErrnoError) if the bytes cannot be had
+				return null;
+			}
+			return p.then(() => node.pagefeatherPin(stream));
+		},
+	};
+}
+
+// #569: the BOOT SELF-CHECK (after Gate 0b's red control read files as EMPTY, silently). A known
+// remote .php (site-remote.py records [name, size, sha256]) is read through PHP at boot: the read
+// path a site depends on. Anything but its exact size and SHA-256 fails the boot, loudly.
+export function selfCheckCode([name]) {
+	return '<?php $c = @file_get_contents(' + JSON.stringify('/' + name) + '); echo is_string($c) ? strlen($c) . "|" . hash("sha256", $c) : "false";';
+}
+export function checkSelfCheck(text, [name, size, sha256]) {
+	const want = size + '|' + sha256;
+	if (String(text).trim() !== want) throw new Error('site self-check failed: /' + name + ' read as ' + JSON.stringify(String(text).slice(0, 80)) + ', want ' + want + ' (SITE_REMOTE reads are not working; the boot is refused)');
 }

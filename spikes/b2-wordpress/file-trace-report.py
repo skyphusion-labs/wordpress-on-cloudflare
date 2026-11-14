@@ -18,6 +18,10 @@ def ext(path):
 def main():
     d = json.load(open(sys.argv[1]))
     reqs = d['requests']
+    # #569: a trace may also hold OPEN events ("site-open:", "opcache-open:"). This report is about
+    # bytes READ, so it drops them (site-trace-report.py reads both).
+    for r in reqs:
+        r['reads'] = [x for x in r['reads'] if '-open:' not in x[0].split('/', 1)[0]]
     by_cls = collections.defaultdict(list)
     for r in reqs:
         by_cls[r['cls']].append(r)

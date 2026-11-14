@@ -139,6 +139,10 @@ jobs:
         run: python3 -I spikes/b2-wordpress/tests/opcache-split-test.py
       - name: b-dosql every OPcache file to packs in cold-boot read order, opcache.zip empty, no boot pack (issue #563)
         run: python3 -I spikes/b2-wordpress/tests/opcache-remote-pack-test.py
+      - name: b-dosql the site.zip trace report reads hand-computed fetches right (issue #569)
+        run: python3 -I spikes/b2-wordpress/tests/site-trace-report-test.py
+      - name: b-dosql site.zip to a hot pack and cold-boot-ordered packs, site.zip empty (issue #569)
+        run: python3 -I spikes/b2-wordpress/tests/site-remote-pack-test.py
       - name: measure394 read-back states, a failed read is never an absent row (issue #519)
         run: python3 -I spikes/b2-wordpress/tests/measure394-state-test.py
       - name: b-dosql runtime guards, raw sockets and PHP messages (issue #452)
@@ -295,6 +299,7 @@ jobs:
         run: |
           node deploy/wfp/tests/dispatcher-test.mjs
           deploy/wfp/tests/render-test.sh
+          deploy/wfp/tests/remote-assets-test.sh
           deploy/wfp/tests/snapshot-wiring-test.sh
           deploy/wfp/tests/phase-b-cron-test.sh
           deploy/wfp/tests/deploy-retry-test.sh
@@ -403,6 +408,16 @@ jobs:
         # loader copy without the import-pattern edit must NOT use the pack; no hook, no wrapped open().
         working-directory: spikes/b2-wordpress
         run: node --test tests/opcache-remote.test.mjs tests/remote-packs.test.mjs
+      - name: site files fetched while PHP pauses in open(), one retry, pinned while open, stat makes no fetch (issue #569)
+        # The real loader, PHP and attachLazyContents: an open file read half, then other packs, must come
+        # back whole with the pin and must NOT without it; a 40,000-call stat storm makes 0 fetches.
+        working-directory: spikes/b2-wordpress
+        run: node --test tests/site-remote.test.mjs
+      - name: php-wasm calls no export that cannot suspend; our code reads no site .php directly (issue #569)
+        # A read inside an export outside exportPattern throws SuspendError (Gate 0b); a failed .php read
+        # gives @file_get_contents "", so our PHP and JS must never read a site .php themselves.
+        working-directory: spikes/b2-wordpress
+        run: node --test tests/phpwasm-exports.test.mjs tests/our-file-reads.test.mjs
   coverage:
     runs-on: ubuntu-latest
     steps:

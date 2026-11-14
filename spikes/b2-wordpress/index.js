@@ -46,7 +46,11 @@ import OPCACHE_BOOT from './build/opcache-boot-index.js';
 // opens one (remote-packs.mjs, opcache-remote.py). No split and no boot pack. null on a default
 // build (build.sh writes it): nothing changes then.
 import OPCACHE_REMOTE from './build/opcache-remote-index.js';
-import { createRemotePacks, REMOTE_FETCH_CAP, REMOTE_HOLD_BYTES } from './remote-packs.mjs';
+// #569 (#394 Gate 2, SITE_REMOTE=1, on top of OPCACHE_REMOTE): site.zip in packs too (site-remote.py).
+// null on a default build. There is NO runtime off switch: the bytes are not in the bundle, so the
+// rollback is a deploy without SITE_REMOTE.
+import SITE_REMOTE from './build/site-remote-index.js';
+import { createRemotePacks, createFetchBudget, createSiteHooks, selfCheckCode, checkSelfCheck, REMOTE_FETCH_CAP, REMOTE_HOLD_BYTES, SITE_FETCH_CAP, SITE_HOLD_BYTES } from './remote-packs.mjs';
 // The build id baked at build time (build.sh writes build/build-id.js), so the
 // object can report which code version it runs (issue #35 slice 5).
 import BUILD_ID from './build/build-id.js';
@@ -395,7 +399,7 @@ async function stageUpload(req, env) {
 }
 
 function newStats() {
-	return { calls: 0, ms: 0, failures: [], log: [], r2: {}, rowsRead: 0, rowsWritten: 0, inflates: 0, inflateBytes: 0, reinflates: 0, lazyWrites: 0, rfN: 0, rfBytes: 0, rfMs: 0, rfFail: 0, rfCapped: 0, dbTables: {}, ocGroups: {}, ocCalls: 0, ocHits: 0, httpCalls: 0, httpMs: 0, txnOps: 0, undoRows: 0 };
+	return { calls: 0, ms: 0, failures: [], log: [], r2: {}, rowsRead: 0, rowsWritten: 0, inflates: 0, inflateBytes: 0, reinflates: 0, lazyWrites: 0, rfN: 0, rfBytes: 0, rfMs: 0, rfFail: 0, rfCapped: 0, rfRetry: 0, rsN: 0, rsBytes: 0, rsMs: 0, rsFail: 0, rsCapped: 0, rsRetry: 0, dbTables: {}, ocGroups: {}, ocCalls: 0, ocHits: 0, httpCalls: 0, httpMs: 0, txnOps: 0, undoRows: 0 };
 }
 
 // Every statement failure goes through here. resetFailTotal counts the isolate memory resets among
@@ -483,21 +487,58 @@ let bootPackPaths = null;
 // #563: the remote OPcache packs of the runtime booted last (null: none), and what its boot did with
 // them, for x-perf (remote): 'packs <n> files', 'off', 'fallback:no-assets-binding', or 'none'.
 let remotePacks = null;
+// #569: the site packs of the runtime booted last, the request budget both share (the soft cap for
+// OPcache opens, the hard cap for site opens), and the site state for x-perf (siteRemote).
+let sitePacks = null;
+let siteHooks = null; // #569: the hybrid hooks (createSiteHooks): .php at read, others at open
+let fetchBudget = null;
+let siteState = 'none';
 let remoteState = 'none';
 const remoteOn = () => Boolean(OPCACHE_REMOTE && ENV && ENV.OPCACHE_REMOTE !== 'off');
 // The loader's open() asks this first (prepare.sh, #563). null: open now. A promise: PHP waits for the
 // pack; if it rejects, the open fails with EIO and OPcache compiles the script from source.
 function remoteOpenHook(path) {
-	if (!remotePacks || path.length <= OPCACHE_DIR.length + 1 || !path.startsWith(OPCACHE_DIR + '/')) return null;
-	return remotePacks.open(path.slice(OPCACHE_DIR.length + 1));
+	if (path.length > OPCACHE_DIR.length + 1 && path.startsWith(OPCACHE_DIR + '/')) return remotePacks ? remotePacks.open(path.slice(OPCACHE_DIR.length + 1)) : null;
+	// #569: a site file (site.zip names have no leading slash). The hybrid: only a NON-.php is fetched at
+	// open (a .php at its first read, remoteReadHook). A directory or a file the index does not hold
+	// (one PHP wrote) is no fetch.
+	return siteHooks ? siteHooks.open(path) : null;
+}
+// #569: the loader's reads ask this first (prepare.sh PY6). A remote .php whose pack is not held yet
+// returns a promise: PHP waits, then reads; a rejection fails the read with EIO before any byte.
+// #569: the remote pack counters, read BEFORE a request awaits its boot, so x-perf counts the fetches
+// the boot itself made (the site self-check). The post-boot start snapshot missed them (pf570m: rsN 13
+// against rsPacks 14 on a booting request).
+function remoteCounters() {
+	return { rfN: stats.rfN, rfBytes: stats.rfBytes, rfMs: stats.rfMs, rfFail: stats.rfFail, rfCapped: stats.rfCapped, rsN: stats.rsN, rsBytes: stats.rsBytes, rsMs: stats.rsMs, rsFail: stats.rsFail, rsCapped: stats.rsCapped, rsRetry: stats.rsRetry };
+}
+function remoteReadHook(stream, kind) {
+	return siteHooks ? siteHooks.read(stream, kind) : null;
 }
 async function fetchRemotePack(name) {
-	const r = await ENV.ASSETS.fetch(new Request('https://assets.local/_pf/' + OPCACHE_REMOTE.id + '/' + name));
+	const r = await ENV.ASSETS.fetch(new Request('https://assets.local/_pf/' + (OPCACHE_REMOTE || SITE_REMOTE).id + '/' + name));
 	if (!r.ok) throw new Error(name + ' answered ' + r.status);
 	return new Uint8Array(await r.arrayBuffer());
 }
 // A node per remote file: its size is known at once (stat needs no bytes), its contents come from
 // the held pack. A read with the pack not held fails with EIO (the open fetches it first).
+// #569: a remote SITE file. The same, but PINNED while open (attachLazyContents tag.pin): no evict
+// drops an open file's bytes, so after a successful open() every read succeeds.
+// #569: a SITE_REMOTE boot that refuses (no ASSETS binding, OPcache off, the self-check failed). The
+// request handler answers it with a 503 that NAMES the reason (x-site-remote-refused), never a bare 500.
+function siteRefusal(code, message) {
+	const e = new Error('site refused (' + code + '): ' + message);
+	e.siteRemoteRefused = code;
+	return e;
+}
+function remoteSiteFile(FS, path, name, size) {
+	FS.writeFile(path, new Uint8Array(0));
+	attachLazyContents(FS.lookupPath(path).node, size, (out) => {
+		const b = sitePacks && sitePacks.data(name, out);
+		if (!b) throw new FS.ErrnoError(29);
+		return b;
+	}, { src: 'site', path, pin: siteHooks.pinMode(name) });
+}
 function remoteFile(FS, path, name, size) {
 	FS.writeFile(path, new Uint8Array(0));
 	attachLazyContents(FS.lookupPath(path).node, size, (out) => {
@@ -577,8 +618,16 @@ function attachLazyContents(node, size, dataFn, tag) {
 	let written = false;
 	let used = size;
 	let inflations = 0; // #394: a second inflate of this file is a RE-inflate (its copy was evicted)
+	// #569: tag.pin (a REMOTE site file). Its bytes come from a pack that may be evicted, so from the
+	// point its pack was fetched until its close, the inflated copy is PINNED: no evict drops it, and it
+	// never lives in the arena (a later alloc could reuse that memory). Two modes (the hybrid):
+	// - 'open' (non-.php): fetched at open(), pinned and inflated by the open;
+	// - 'read' (.php): fetched at the FIRST READ (prepare.sh PY6), pinned there by pagefeatherPin.
+	// After the pin, every read succeeds; the only failure point is the fetch: never a half file.
+	const pin = tag && tag.pin ? (tag.pin === 'read' ? 'read' : 'open') : null;
+	let pins = 0;
 	const drop = () => {
-		if (!written) contents = null;
+		if (!written && pins === 0) contents = null;
 	};
 	Object.defineProperty(node, 'contents', {
 		configurable: true,
@@ -589,7 +638,7 @@ function attachLazyContents(node, size, dataFn, tag) {
 				// #394 step 2: with LAZY_ARENA=on, a deflated file inflates into the arena (a stored one is a view
 				// of the bundle and needs no buffer; a file larger than the arena gets its own, as before).
 				let inArena = false;
-				const out = arenaOn() ? (n) => { const v = getArena().alloc(n, drop); inArena = !!v; return v; } : null;
+				const out = arenaOn() && !pin ? (n) => { const v = getArena().alloc(n, drop); inArena = !!v; return v; } : null;
 				contents = dataFn(out);
 				if (inArena) {
 					stats.inflates++;
@@ -622,7 +671,56 @@ function attachLazyContents(node, size, dataFn, tag) {
 	// view into the bundle, the inflate cache or the arena) and mark the file written. msync calls
 	// MEMFS.stream_ops.write directly, so it is wrapped too.
 	const base = node.stream_ops;
-	if (base && typeof base.write === 'function') {
+	// #569 (Gate 2, step 3): FILE_TRACE=on also records each OPEN of a bundle file, as "<src>-open:" keys
+	// beside the reads (the contents getter). The open() hook fetches on an open, and PHP opens files it
+	// never reads (OPcache resolves a source it serves from its cache), so a trace of reads alone
+	// measured the wrong event. Off with FILE_TRACE; consumers that match "site:" or "opcache:" never
+	// see these keys.
+	if (tag && base && tracing()) {
+		const tbase = node.stream_ops;
+		node.stream_ops = Object.assign(Object.create(tbase), {
+			open(stream) {
+				fileTrace.read(tag.src + '-open', tag.path, size);
+				if (typeof tbase.open === 'function') tbase.open(stream);
+			},
+		});
+	}
+	const base2 = node.stream_ops;
+	if (pin && base2) {
+		// #569: FS.open copies node.stream_ops into the stream and calls its open, FS.close its close.
+		const pinStream = (stream) => {
+			pins++;
+			stream.pfPinned = true;
+			try {
+				void node.contents; // inflate now, from the pack the fetch made sure is held
+			} catch (e) {
+				pins--;
+				stream.pfPinned = false;
+				throw e;
+			}
+		};
+		const pinned = Object.create(base2);
+		if (pin === 'open') {
+			pinned.open = function (stream) {
+				pinStream(stream);
+				if (typeof base2.open === 'function') base2.open(stream);
+			};
+		} else {
+			// The read hook (remote-packs.mjs createSiteHooks) pins at the first read.
+			node.pagefeatherName = tag.path.slice(1);
+			node.pagefeatherPin = pinStream;
+		}
+		pinned.close = function (stream) {
+			if (stream.pfPinned) {
+				stream.pfPinned = false;
+				if (pins > 0) pins--;
+			}
+			if (typeof base2.close === 'function') base2.close(stream);
+		};
+		node.stream_ops = pinned;
+	}
+	const wbase = node.stream_ops;
+	if (wbase && typeof wbase.write === 'function') {
 		const own = () => {
 			if (written) return;
 			const c = node.contents; // inflates if it was dropped
@@ -630,12 +728,12 @@ function attachLazyContents(node, size, dataFn, tag) {
 			written = true;
 			stats.lazyWrites++;
 		};
-		node.stream_ops = Object.assign(Object.create(base), {
+		node.stream_ops = Object.assign(Object.create(wbase), {
 			write(stream, buffer, offset, length, position, canOwn) {
 				own();
-				return base.write(stream, buffer, offset, length, position, canOwn);
+				return wbase.write(stream, buffer, offset, length, position, canOwn);
 			},
-			...(typeof base.msync === 'function' ? { msync(stream, buffer, offset, length, flags) { own(); return base.msync(stream, buffer, offset, length, flags); } } : {}),
+			...(typeof wbase.msync === 'function' ? { msync(stream, buffer, offset, length, flags) { own(); return wbase.msync(stream, buffer, offset, length, flags); } } : {}),
 		});
 	}
 }
@@ -1349,7 +1447,9 @@ async function boot(origin) {
 		// is that outbound traffic goes through the WordPress HTTP API and its host allowlist.
 		websocket: { decorator: refuseSocketsDecorator((info) => console.log(JSON.stringify({ m: 'socket', refused: info }))) },
 		// #563: only on an OPCACHE_REMOTE build. Without it the loader does not wrap open() at all.
-		...(remoteOn() ? { pagefeatherOpen: remoteOpenHook } : {}),
+		...(remoteOn() || SITE_REMOTE ? { pagefeatherOpen: remoteOpenHook } : {}),
+		// #569: only on a SITE_REMOTE build. Without it no read path is wrapped at all.
+		...(SITE_REMOTE ? { pagefeatherRead: remoteReadHook } : {}),
 	});
 	const php = new PHP(id);
 	lastBootedPhp = php;
@@ -1418,7 +1518,45 @@ async function boot(origin) {
 		const mb = Number(ENV.LAZY_CACHE_MB);
 		if (Number.isFinite(mb)) LAZY_CACHE_BYTES = Math.max(1, mb) * 1024 * 1024; // a non-numeric value keeps the default, not NaN.
 	}
-	if (ENV.LAZY_NODES === 'on') {
+	// #569: the request budget, shared by the OPcache and the site packs.
+	const intEnv = (v, lo, hi, dflt) => { const n = Number(v); return Number.isInteger(n) && n >= lo && n <= hi ? n : dflt; };
+	const softCap = intEnv(ENV.REMOTE_FETCH_CAP, 0, 1000, REMOTE_FETCH_CAP);
+	const hardCap = Math.max(softCap, intEnv(ENV.SITE_FETCH_CAP, 0, 1000, SITE_FETCH_CAP));
+	fetchBudget = createFetchBudget({ soft: softCap, hard: hardCap });
+	sitePacks = null;
+	siteState = SITE_REMOTE ? 'none' : 'none:not-built';
+	if (SITE_REMOTE) {
+		// site.zip is EMPTY on this build: every site file is a remote node. Without the binding the
+		// site cannot be served at all, so the boot fails, loudly (never a site with no files).
+		if (!ENV.ASSETS) {
+			siteState = 'fail:no-assets-binding';
+			console.error(JSON.stringify({ m: 'site-remote', fail: 'no ASSETS binding: a SITE_REMOTE build cannot serve its files' }));
+			throw siteRefusal('no-assets', 'a SITE_REMOTE build without an ASSETS binding cannot serve its files');
+		}
+		// The lead's ruling on #570: OPcache OFF with remote sources cannot fit the fetch budget (every
+		// script compiles, so every source is read: woo.py's checkout passed the hard cap of 96). Refused,
+		// loudly, never a thrash.
+		if (!OPCACHE_REMOTE || ENV.OPCACHE_REMOTE === 'off') {
+			siteState = 'fail:opcache-off';
+			console.error(JSON.stringify({ m: 'site-remote', fail: 'OPCACHE_REMOTE is off: a SITE_REMOTE build needs the remote OPcache' }));
+			throw siteRefusal('opcache-off', 'a SITE_REMOTE build with OPcache off cannot fit the fetch budget');
+		}
+		const siteHold = intEnv(ENV.SITE_HOLD_KIB, 0, 65536, SITE_HOLD_BYTES / 1024) * 1024;
+		siteHooks = null;
+		sitePacks = createRemotePacks({
+			index: SITE_REMOTE, fetchPack: fetchRemotePack, parse: zipEntries, stats, prefix: 'rs', budget: fetchBudget, limit: 'hard',
+			holdBytes: siteHold, retries: 1, retryDelayMs: intEnv(ENV.SITE_RETRY_MS, 0, 5000, 50), log: (o) => console.error(JSON.stringify(o)),
+		});
+		siteHooks = createSiteHooks(sitePacks);
+		for (const d of SITE_REMOTE.dirs) mkdirp('/' + d);
+		for (const [name, [, size]] of Object.entries(SITE_REMOTE.files)) {
+			const full = '/' + name;
+			remoteSiteFile(FS, full, name, size);
+			count++;
+			fileBytes += size;
+		}
+		siteState = `packs ${SITE_REMOTE.packs.length} hotKiB ${SITE_REMOTE.hot ? Math.round(SITE_REMOTE.hot.bytes / 1024) : 0} files ${count} cap ${hardCap} holdKiB ${Math.round(siteHold / 1024)}`;
+	} else if (ENV.LAZY_NODES === 'on') {
 		// Lazy MEMFS nodes (#218): mount the site tree by index; nodes are created
 		// only when PHP first looks a path up, not ~6800 at boot. b-dosql default
 		// off (the eager path below is unchanged) until this is proven for A.
@@ -1470,11 +1608,10 @@ async function boot(origin) {
 		remoteState = 'fallback:no-assets-binding';
 		console.error(JSON.stringify({ m: 'remote', fallback: 'compile', why: 'no ASSETS binding' }));
 	} else if (OPCACHE_REMOTE) {
-		const capRaw = Number(ENV.REMOTE_FETCH_CAP);
-		const cap = Number.isInteger(capRaw) && capRaw >= 0 && capRaw <= 1000 ? capRaw : REMOTE_FETCH_CAP;
-		const holdRaw = Number(ENV.REMOTE_HOLD_KIB);
-		const holdBytes = Number.isInteger(holdRaw) && holdRaw >= 0 && holdRaw <= 65536 ? holdRaw * 1024 : REMOTE_HOLD_BYTES;
-		remotePacks = createRemotePacks({ index: OPCACHE_REMOTE, fetchPack: fetchRemotePack, parse: zipEntries, stats, cap, holdBytes, log: (o) => console.error(JSON.stringify(o)) });
+		const cap = softCap;
+		const holdBytes = intEnv(ENV.REMOTE_HOLD_KIB, 0, 65536, REMOTE_HOLD_BYTES / 1024) * 1024;
+		// #569: the shared budget; OPcache opens stop at the soft cap (a compile), site opens go on.
+		remotePacks = createRemotePacks({ index: OPCACHE_REMOTE, fetchPack: fetchRemotePack, parse: zipEntries, stats, budget: fetchBudget, limit: 'soft', holdBytes, log: (o) => console.error(JSON.stringify(o)) });
 		let n = 0;
 		for (const [name, [, size]] of Object.entries(OPCACHE_REMOTE.files)) {
 			const full = OPCACHE_DIR + '/' + name;
@@ -1605,6 +1742,22 @@ async function boot(origin) {
 	// the AI binding does for alt text.
 	if (analyticsEnabled(ENV)) lines.push(`define('SKYPHUSION_ANALYTICS', true);`);
 	php.writeFile(DOCROOT + '/wp-runtime.php', lines.join('\n') + '\n');
+
+	// #569: the BOOT SELF-CHECK. Gate 0b's red control read files as EMPTY, with no error: a SITE_REMOTE
+	// build whose read path is broken would serve empty PHP. A known remote .php is read through PHP
+	// here and must match its recorded size and SHA-256, or the boot fails, loudly.
+	if (SITE_REMOTE) {
+		try {
+			if (!SITE_REMOTE.selfcheck) throw new Error('site self-check failed: the site index has no selfcheck entry (an old site-remote.py?)');
+			const r = await php.run({ code: selfCheckCode(SITE_REMOTE.selfcheck) });
+			checkSelfCheck(r.text, SITE_REMOTE.selfcheck);
+			siteState += ' selfcheck ok';
+		} catch (e) {
+			siteState = 'fail:selfcheck';
+			console.error(JSON.stringify({ m: 'site-remote', fail: String((e && e.message) || e).slice(0, 300) }));
+			throw siteRefusal('selfcheck', 'the boot self-check failed: SITE_REMOTE reads are not working');
+		}
+	}
 
 	php.onMessage(handleMessage);
 
@@ -2987,6 +3140,8 @@ async function runCron(booted, cleanDue = false, mail = null) {
 			tickMail = null;
 			evictLazy();
 			if (remotePacks) remotePacks.endRequest(); // #563: held packs live for one request
+			if (sitePacks) sitePacks.endRequest(); // #569: the site packs too (not the hot pack)
+			if (fetchBudget) fetchBudget.reset(); // #569: the request's subrequest budget
 			dropBootPack(php[__private__dont__use].FS); // #394 L1: a cron run that booted drops the boot files too
 		}
 		let out = {};
@@ -3487,11 +3642,12 @@ async function handle(req, env, url, spikeOk, maxBody, ctx) {
 			const tBoot = Date.now();
 			const booted = !bootPromise;
 			if (tracing()) fileTrace.begin({ cls: routeClass(req.method, url.pathname, url.search), method: req.method, path: url.pathname, boot: booted ? 1 : 0 });
+			const remote0 = remoteCounters();
 			bootPromise ??= boot(origin);
 			const { php, handler, bootMs } = await bootPromise;
 			const bootWaitMs = Date.now() - tBoot;
 			const wasm0 = php[__private__dont__use].HEAPU8.length;
-			const start = { dbTables: { ...stats.dbTables }, ocGroups: { ...stats.ocGroups }, calls: stats.calls, ms: stats.ms, fail: stats.failures.length, log: stats.log.length, rowsRead: stats.rowsRead, rowsWritten: stats.rowsWritten, inflates: stats.inflates, inflateBytes: stats.inflateBytes, reinflates: stats.reinflates, lazyWrites: stats.lazyWrites, rfN: stats.rfN, rfBytes: stats.rfBytes, rfMs: stats.rfMs, rfFail: stats.rfFail, rfCapped: stats.rfCapped, ocCalls: stats.ocCalls, ocHits: stats.ocHits, httpCalls: stats.httpCalls, txnOps: stats.txnOps, undoRows: stats.undoRows };
+			const start = { dbTables: { ...stats.dbTables }, ocGroups: { ...stats.ocGroups }, calls: stats.calls, ms: stats.ms, fail: stats.failures.length, log: stats.log.length, rowsRead: stats.rowsRead, rowsWritten: stats.rowsWritten, inflates: stats.inflates, inflateBytes: stats.inflateBytes, reinflates: stats.reinflates, lazyWrites: stats.lazyWrites, rfN: stats.rfN, rfBytes: stats.rfBytes, rfMs: stats.rfMs, rfFail: stats.rfFail, rfCapped: stats.rfCapped, rsN: stats.rsN, rsBytes: stats.rsBytes, rsMs: stats.rsMs, rsFail: stats.rsFail, rsCapped: stats.rsCapped, rsRetry: stats.rsRetry, ocCalls: stats.ocCalls, ocHits: stats.ocHits, httpCalls: stats.httpCalls, txnOps: stats.txnOps, undoRows: stats.undoRows };
 			const delta = () => ({ calls: stats.calls - start.calls, ms: stats.ms - start.ms, failures: stats.failures.slice(start.fail), log: stats.log.slice(start.log) });
 			const t0 = Date.now();
 			if (url.pathname === '/_install') {
@@ -3606,6 +3762,8 @@ async function handle(req, env, url, spikeOk, maxBody, ctx) {
 			if (tracing()) fileTrace.end({ status: r.httpStatusCode });
 			evictLazy();
 			if (remotePacks) remotePacks.endRequest(); // #563: held packs live for one request
+			if (sitePacks) sitePacks.endRequest(); // #569: the site packs too (not the hot pack)
+			if (fetchBudget) fetchBudget.reset(); // #569: the request's subrequest budget
 			dropBootPack(php[__private__dont__use].FS); // #394 L1: the boot files are no longer needed
 			const wasmBytes = php[__private__dont__use].HEAPU8.length;
 			out.set('x-wasm-mib', String(Math.round(wasmBytes / 1048576)));
@@ -3647,12 +3805,17 @@ async function handle(req, env, url, spikeOk, maxBody, ctx) {
 					wasm1MiB: Math.round(wasmBytes / 1048576),
 					...(booted ? { l1: l1State } : {}), // #394 L1: where this boot's OPcache boot pack came from
 					...(booted && OPCACHE_REMOTE ? { remote: remoteState } : {}), // #563: the remote OPcache packs at this boot
+					...(booted && SITE_REMOTE ? { siteRemote: siteState } : {}), // #569: the remote site packs at this boot
+					// #569: site pack fetches this request (subrequests, the one retry included), KiB, ms,
+					// the failed ones (an honest 500 if PHP required the file), the retries, the opens past
+					// the hard cap, the distinct packs, and the held high-water (the hot pack not included).
+					...(SITE_REMOTE ? { rsN: stats.rsN - remote0.rsN, rsKiB: Math.round((stats.rsBytes - remote0.rsBytes) / 1024), rsMs: stats.rsMs - remote0.rsMs, rsFail: stats.rsFail - remote0.rsFail, rsRetry: stats.rsRetry - remote0.rsRetry, rsCapped: stats.rsCapped - remote0.rsCapped, rsPacks: sitePacks ? sitePacks.lastDistinct() : 0, rsHeldKiB: sitePacks ? Math.round(sitePacks.lastHeldMax() / 1024) : 0 } : {}),
 					// #563: remote OPcache pack fetches this request (each one is a subrequest), their KiB and ms,
 					// the failed ones (a clean miss: OPcache compiled from source), the opens past the cap, and
 					// the high-water of held packs (after LRU eviction; a dropped pack is garbage until V8
 					// collects it, which /_headroom measures, not this field), and the DISTINCT packs fetched:
 					// rfN minus rfPacks is the refetch count, the held budget thrashing.
-					...(OPCACHE_REMOTE ? { rfN: stats.rfN - start.rfN, rfKiB: Math.round((stats.rfBytes - start.rfBytes) / 1024), rfMs: stats.rfMs - start.rfMs, rfFail: stats.rfFail - start.rfFail, rfCapped: stats.rfCapped - start.rfCapped, rfHeldKiB: remotePacks ? Math.round(remotePacks.lastHeldMax() / 1024) : 0, rfPacks: remotePacks ? remotePacks.lastDistinct() : 0 } : {}),
+					...(OPCACHE_REMOTE ? { rfN: stats.rfN - remote0.rfN, rfKiB: Math.round((stats.rfBytes - remote0.rfBytes) / 1024), rfMs: stats.rfMs - remote0.rfMs, rfFail: stats.rfFail - remote0.rfFail, rfCapped: stats.rfCapped - remote0.rfCapped, rfHeldKiB: remotePacks ? Math.round(remotePacks.lastHeldMax() / 1024) : 0, rfPacks: remotePacks ? remotePacks.lastDistinct() : 0 } : {}),
 					...(ledgerActive ? { mem: ledgerSnapshot('end') } : {}), // #394: the isolate memory ledger
 					bytes: r.bytes.length,
 					httpCalls: stats.httpCalls - start.httpCalls,
@@ -3681,6 +3844,8 @@ async function handle(req, env, url, spikeOk, maxBody, ctx) {
 			// The stack names internal paths. It goes to the tail log for every caller, never to the body,
 			// so a leaked spike token cannot also leak stacks.
 			console.error(String((e && e.stack) || e));
+			// #569: a SITE_REMOTE boot refusal says why (a fixed code and text; no internal path).
+			if (e && e.siteRemoteRefused) return new Response('site unavailable: ' + e.siteRemoteRefused + '\n', { status: 503, headers: { 'x-site-remote-refused': e.siteRemoteRefused, 'cache-control': 'no-store' } });
 			return new Response('internal error', { status: 500 });
 		}
 	}

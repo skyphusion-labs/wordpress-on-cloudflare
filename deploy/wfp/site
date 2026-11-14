@@ -84,7 +84,7 @@ update_one_inner() {
   use_recorded_inputs "$bucket" "$WDIR" || { echo "site $s: update refused; nothing was changed" >&2; return 2; }
   # The site's recorded settings (#558): kept unless this run sets one or DROP_SETTINGS names it.
   # local -x keeps them inside this one update (update --all runs many).
-  local -x PHP_INI="${PHP_INI:-}" LAZY_CACHE_MB="${LAZY_CACHE_MB:-}" LAZY_ARENA="${LAZY_ARENA:-}" LAZY_ARENA_MB="${LAZY_ARENA_MB:-}" PHP_RECYCLE="${PHP_RECYCLE:-}" CRON_INTERVAL_MS="${CRON_INTERVAL_MS:-}" TURNSTILE_SITEKEY="${TURNSTILE_SITEKEY:-}" TURNSTILE_WOO="${TURNSTILE_WOO:-}" TURNSTILE_LOGIN="${TURNSTILE_LOGIN:-}" TURNSTILE_COMMENTS="${TURNSTILE_COMMENTS:-}" MAIL_FROM="${MAIL_FROM:-}" MAIL_FROM_NAME="${MAIL_FROM_NAME:-}" PHP_LOCATION="${PHP_LOCATION:-}" WP_VECTORIZE_SEARCH="${WP_VECTORIZE_SEARCH:-}" OPCACHE_SPLIT="${OPCACHE_SPLIT:-}" OPCACHE_REMOTE="${OPCACHE_REMOTE:-}"
+  local -x PHP_INI="${PHP_INI:-}" LAZY_CACHE_MB="${LAZY_CACHE_MB:-}" LAZY_ARENA="${LAZY_ARENA:-}" LAZY_ARENA_MB="${LAZY_ARENA_MB:-}" PHP_RECYCLE="${PHP_RECYCLE:-}" CRON_INTERVAL_MS="${CRON_INTERVAL_MS:-}" TURNSTILE_SITEKEY="${TURNSTILE_SITEKEY:-}" TURNSTILE_WOO="${TURNSTILE_WOO:-}" TURNSTILE_LOGIN="${TURNSTILE_LOGIN:-}" TURNSTILE_COMMENTS="${TURNSTILE_COMMENTS:-}" MAIL_FROM="${MAIL_FROM:-}" MAIL_FROM_NAME="${MAIL_FROM_NAME:-}" PHP_LOCATION="${PHP_LOCATION:-}" WP_VECTORIZE_SEARCH="${WP_VECTORIZE_SEARCH:-}" OPCACHE_SPLIT="${OPCACHE_SPLIT:-}" OPCACHE_REMOTE="${OPCACHE_REMOTE:-}" SITE_REMOTE="${SITE_REMOTE:-}" REMOTE_FETCH_CAP="${REMOTE_FETCH_CAP:-}" REMOTE_HOLD_KIB="${REMOTE_HOLD_KIB:-}" SITE_FETCH_CAP="${SITE_FETCH_CAP:-}" SITE_HOLD_KIB="${SITE_HOLD_KIB:-}" SITE_RETRY_MS="${SITE_RETRY_MS:-}"
   local SETTINGS_RECORDED=0
   echo "site $s: the recorded settings"
   keep_settings "$bucket" "$WDIR" || { echo "site $s: update refused; nothing was changed" >&2; return 2; }
@@ -154,6 +154,8 @@ update_one_inner() {
   echo "site $s: upload build $new (was ${rollback:-unknown}); reason: $reasons"
   # WP_VECTORIZE_SEARCH (#330): the binding needs its index to exist at deploy (lib.sh).
   if search_on; then ensure_search_index "$s" || { rm -rf "$W"; [ -n "$SAVED" ] && rm -rf "$SAVED"; return 1; }; fi
+  # #569: a remote build is never uploaded without its ASSETS binding and /_pf/ first.
+  remote_assets_check "$CONF" "$APP" || { echo "site $s: update refused; nothing was uploaded" >&2; rm -rf "$W"; [ -n "$SAVED" ] && rm -rf "$SAVED"; return 2; }
   bundle_size_check || { rm -rf "$W"; [ -n "$SAVED" ] && rm -rf "$SAVED"; return 1; }
   # A failed upload changed nothing live; the log is read BEFORE the work dir goes.
   (cd "$APP" && "$WR" deploy --config "$CONF" --dispatch-namespace "$NAMESPACE" --secrets-file "$W/sec.json") > "$W/up.log" 2>&1 || { echo "site $s: upload failed:" >&2; tail -20 "$W/up.log" >&2; rm -rf "$W"; [ -n "$SAVED" ] && rm -rf "$SAVED"; return 1; }
@@ -207,7 +209,10 @@ update_one_inner() {
     fi
     cp "$CONF" "$SAVED/wrangler.rollback.toml"
     local W2; W2=$(mktemp -d)
-    if tfr site output -json | site_secrets_json "$W2/sec.json" && (cd "$SAVED" && "$RBWR" deploy --config "$SAVED/wrangler.rollback.toml" --dispatch-namespace "$NAMESPACE" --secrets-file "$W2/sec.json") > "$W2/rb.log" 2>&1; then
+    # #569: the rollback tree is a build too: a remote one needs its assets in this config.
+    if ! remote_assets_check "$SAVED/wrangler.rollback.toml" "$SAVED"; then
+      echo "site $s: the rollback was REFUSED: its build and this config do not fit (remote_assets_check above); deploy the old build by hand" >&2
+    elif tfr site output -json | site_secrets_json "$W2/sec.json" && (cd "$SAVED" && "$RBWR" deploy --config "$SAVED/wrangler.rollback.toml" --dispatch-namespace "$NAMESPACE" --secrets-file "$W2/sec.json") > "$W2/rb.log" 2>&1; then
       echo "site $s: re-deployed ${live_build:-unknown}"
       tfr site apply -input=false -auto-approve "${REC_VARS[@]}" -var "build=$live_build" -var "config_hash=$live_hash" >/dev/null || echo "site $s: the site map entry did not record the rollback build $live_build" >&2
       wait_build "$ORIGIN" "$TOK" "$live_build" || echo "site $s: /_build did not return to $live_build after the rollback re-deploy" >&2

@@ -115,7 +115,8 @@ test('index.js: off by default; both inflate sites take the arena; evictLazy emp
 	assert.match(src, /function arenaOn\(\) \{ return !!\(ENV && ENV\.LAZY_ARENA === 'on'\); \}/);
 	assert.equal((src.match(/inflateSync\(raw, \{ out: \(out && out\(size\)\) \|\| new Uint8Array\(size\) \}\)/g) || []).length, 2, 'zipEntries.data and lazyEntryData');
 	assert.ok(!/inflateSync\(raw, \{ out: new Uint8Array\(size\) \}\)/.test(src), 'no inflate site left outside the arena path');
-	assert.match(src, /const out = arenaOn\(\) \? \(n\) => \{ const v = getArena\(\)\.alloc\(n, drop\); inArena = !!v; return v; \} : null;/);
+	// #569: a PINNED file (a remote site file) never inflates into the arena; every other one does.
+	assert.match(src, /const out = arenaOn\(\) && !pin \? \(n\) => \{ const v = getArena\(\)\.alloc\(n, drop\); inArena = !!v; return v; \} : null;/);
 	assert.match(src, /if \(inflateArena\) inflateArena\.evictAll\(\);/);
 	assert.match(src, /reinflates: stats\.reinflates - start\.reinflates/);
 	assert.match(src, /arenaEvict: inflateArena\.counts\.evicts - ledgerInfl0\.ae/);
