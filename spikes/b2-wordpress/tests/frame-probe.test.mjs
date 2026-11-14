@@ -59,3 +59,18 @@ test('index.js: the Worker logs the /_frame probe raw result, and /_frame answer
 	assert.match(src, /url\.pathname === '\/_frame' && frameSpikeOk/);
 	assert.match(src, /wl\.headers\['x-pf-req'\] = pfReq/, 'the write-loss answer names its request id');
 });
+
+// pf352f at ebb62f5, 2026-11-14 18:08Z: recovery rolled the frame back (frame-recover active 1, undone 1),
+// but every /_frame call answered 500 "missing x-wp-public-origin": the object's fetch refuses a request
+// with no public origin BEFORE it routes, and the Worker's probe sends none. /_frame needs no origin.
+test('index.js: the object answers /_frame BEFORE its public-origin guard (the probe carries no origin)', () => {
+	const src = readFileSync(new URL('../index.js', import.meta.url), 'utf8');
+	const f = src.indexOf('async fetch(raw) {');
+	assert.ok(f > 0);
+	const body = src.slice(f, f + 20000);
+	const frame = body.indexOf("objectUrl.pathname === '/_frame'");
+	const guard = body.indexOf("'missing ' + ORIGIN_HEADER");
+	assert.ok(frame > 0, 'the object routes /_frame on its own URL');
+	assert.ok(guard > 0);
+	assert.ok(frame < guard, '/_frame is answered before the origin guard');
+});

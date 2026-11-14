@@ -429,3 +429,21 @@ test('a frame open logs one line once it is COMMITTED (never for a no-op that to
 	run(u, db, "INSERT INTO t (v) VALUES ('A')");
 	assert.deepEqual(logs.filter((l) => l.m === 'frame-open').map((l) => [l.req, l.by]), [['f3', 'INSERT t']]);
 });
+
+// The lead asked for the frame's OWN rows: x-db-rows counts PHP's statements (their undo-trigger rows
+// included), never the frame's own (the open, the close, the history, the log cleared at close).
+test('counts.own: the rows the frame itself writes, exactly; a no-op that took its open back adds none', () => {
+	const { db } = site();
+	const { u } = isolate();
+	u.arm(db, 'o1');
+	run(u, db, NOOPS[0]);
+	assert.equal(u.counts().own, 0, 'the taken-back open is not counted');
+	run(u, db, "INSERT INTO t (v) VALUES ('A')");
+	run(u, db, "INSERT INTO t (v) VALUES ('B')");
+	const atOpen = u.counts().own;
+	// open: active 0 -> 1 (1) + the _wp_frame row (1) (+ the undo-state seed row the first time: 1)
+	assert.ok(atOpen >= 2 && atOpen <= 3, 'open: ' + atOpen);
+	u.end(db);
+	// close: active 1 -> 0 (1) + the 2 undo rows cleared (2) + the _wp_frame row updated (1)
+	assert.equal(u.counts().own - atOpen, 4, 'close');
+});

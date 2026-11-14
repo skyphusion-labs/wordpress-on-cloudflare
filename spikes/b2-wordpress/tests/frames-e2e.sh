@@ -61,7 +61,8 @@ for kind in ('save', 'postnew', 'public'):
     opened = sum(1 for f in fr if f and f.get('opened'))
     miss = sum((f or {}).get('miss', 0) for f in fr)
     written = statistics.median(r['written']) if r['written'] else None
-    print('MEASURE %s %s n=%d dbMs_med=%s dbN_med=%s written_med=%s frames_opened=%d miss=%d' % (mode, kind, len(p), med('dbMs'), med('dbN'), written, opened, miss))
+    own = statistics.median([(f or {}).get('own', 0) for f in fr]) if fr else None
+    print('MEASURE %s %s n=%d dbMs_med=%s dbN_med=%s written_med=%s frame_own_med=%s frames_opened=%d miss=%d' % (mode, kind, len(p), med('dbMs'), med('dbN'), written, own, opened, miss))
     bys = sorted(set((f or {}).get('by') for f in fr if f and f.get('by')))
     if bys: print('OPENED-BY %s %s: %s' % (mode, kind, ' | '.join(bys)))
     if mode == 'on':
@@ -72,6 +73,15 @@ for kind in ('save', 'postnew', 'public'):
 print('OK' if ok else 'NOTOK')
 PY
   cat "$T/out"
+  # #352: the Worker's /_frame (spike token) reads the last save's frame through the same object call the
+  # write-loss answer uses (pf352f at ebb62f5: that call got 500 "missing x-wp-public-origin", so the frame
+  # read null and a proven rollback still got today's message). Frames on: it must read state kept.
+  if [ "$mode" = on ]; then
+    fid=$(grep '^save x-perf' "$T/perf" | tail -1 | cut -d' ' -f3- | python3 -c "import json,sys; print(((json.loads(sys.stdin.read()) or {}).get('frame') or {}).get('req') or '')")
+    fst=$(curl -s "${ST[@]}" "$B/_frame?id=$fid" | python3 -c "import json,sys; print(((json.load(sys.stdin) or {}).get('frame') or {}).get('state', 'null'))" 2>/dev/null)
+    echo "FRAME-READ on save id=${fid:-none} state=$fst"
+    ok "on: the Worker reads a kept frame back over /_frame" "$([ -n "$fid" ] && [ "$fst" = kept ] && echo 1 || echo 0)"
+  fi
   ok "$mode: frame cost and laziness checks" "$(tail -1 "$T/out" | grep -qx OK && echo 1 || echo 0)"
   rm -rf "$T"
 done
