@@ -8,8 +8,11 @@
 // php/real-transactions.php.
 //
 // #352, the request frame (frames = REQUEST_FRAMES=on): a request is armed (arm()) before PHP runs.
-// The frame OPENS LAZILY, just before the request's first statement that may write (beforeStatement,
-// called by index.js sqlStatement for every PHP statement), so a request that only reads pays nothing.
+// The frame OPENS LAZILY, at the request's first statement that CHANGES a row (statement(), which
+// index.js sqlStatement runs every PHP statement through): the open, the statement and its first undo
+// row run in ONE storage transaction, and a statement that may write but changed no row (an UPDATE or
+// DELETE matching nothing, an INSERT OR IGNORE that conflicts) takes the open back, so a request that
+// changes nothing commits nothing durable for the frame (counts.noop).
 // It closes KEPT when the request ends (end()), a PHP fatal included: the frame hides OUR platform's
 // failure (an isolate reset), not WordPress's (autocommit semantics). It closes ROLLED BACK only by
 // recover() in the next isolate. Inside a frame:
@@ -24,19 +27,23 @@
 const UNDO_TABLES = new Set(['_wp_undo', '_wp_undo_state', '_wp_frame']);
 const FRAME_HISTORY = 32;
 
-/** A statement that may write. Conservative: only a plain SELECT or EXPLAIN and a query PRAGMA are reads. */
+/**
+ * A statement that may change a row the undo triggers cover. Conservative: everything may, except a plain
+ * SELECT or EXPLAIN and the statements that change no covered row: any PRAGMA (a setter too), VACUUM,
+ * ANALYZE and REINDEX. Those must also never run inside the frame's opening transaction (SQLite ignores
+ * PRAGMA foreign_keys in one, VACUUM refuses one). CI at 105776b: a PRAGMA opened 10 of 10 public frames.
+ */
 export function mayWrite(sql) {
 	const s = String(sql || '');
 	if (/\bRETURNING\b/i.test(s)) return true;
-	if (/^\s*(SELECT|EXPLAIN)\b/i.test(s)) return false;
-	if (/^\s*PRAGMA\s+[\w.]+\s*(\(\s*[^)]*\)\s*)?;?\s*$/i.test(s)) return false;
+	if (/^\s*(SELECT|EXPLAIN|PRAGMA|VACUUM|ANALYZE|REINDEX)\b/i.test(s)) return false;
 	return true;
 }
 /** The verb and the first table of a statement, for a log or x-perf: never its values. */
 export function shapeOf(sql) {
 	const s = String(sql || '').replace(/\s+/g, ' ').trim();
 	const verb = (s.match(/^(\w+)/) || [, '?'])[1].toUpperCase();
-	const t = s.match(/\b(?:INTO|FROM|UPDATE|TABLE)\s+[`"]?([A-Za-z0-9_]+)/i);
+	const t = s.match(/\b(?:INTO|FROM|UPDATE|TABLE|PRAGMA)\s+[`"]?([A-Za-z0-9_]+)/i);
 	const or = s.match(/^\w+\s+OR\s+(\w+)/i);
 	const onc = /\bON\s+CONFLICT\b/i.test(s) ? ' ON CONFLICT' : '';
 	return verb + (or ? ' OR ' + or[1].toUpperCase() : '') + (t ? ' ' + t[1] : '') + onc;
@@ -75,7 +82,7 @@ export function createUndoLog({ stats, objectCacheDrop = () => {}, log = () => {
 	let kinds = [];
 	let deferred = [];
 	let recovered = false;
-	const counts = { opened: 0, kept: 0, points: 0, miss: 0 };
+	const counts = { opened: 0, kept: 0, points: 0, miss: 0, noop: 0 };
 	let openedBy = null; // the shape (verb and table, never values) of the statement that opened the last frame
 
 	function undoSetup(db) {
@@ -186,6 +193,42 @@ export function createUndoLog({ stats, objectCacheDrop = () => {}, log = () => {
 			if (!armedReq) return;
 			if (frameOpen && isDdl(sql)) return this.commitPoint(db, 'ddl');
 			if (!frameOpen && mayWrite(sql) && !isDdl(sql)) frameOpenNow(db, sql);
+		},
+		/**
+		 * Run one PHP statement (fn runs it and returns its result). When it would open the frame, the open,
+		 * the statement and its first undo row run in one storage transaction; if the statement left no undo
+		 * row and reported no row written, the transaction is rolled back, so the open is never committed.
+		 * The statement itself changed nothing, so rolling it back loses nothing: fn's result is returned as
+		 * is (changes 0). An undo row decides, not the reported count alone (a counter may under-report).
+		 */
+		statement(db, storage, sql, fn) {
+			const opens = armedReq && !frameOpen && mayWrite(sql) && !isDdl(sql) && storage && typeof storage.transactionSync === 'function';
+			if (!opens) {
+				this.beforeStatement(db, sql);
+				return fn();
+			}
+			const NOOP = {};
+			let result;
+			try {
+				storage.transactionSync(() => {
+					frameOpenNow(db, sql);
+					const seq = undoSeq(db);
+					result = fn();
+					const logged = db.exec('SELECT COUNT(*) AS n FROM _wp_undo WHERE seq > ?', seq).one().n;
+					const written = result && typeof result.rowsWritten === 'number' ? result.rowsWritten : 0;
+					if (logged === 0 && written === 0) throw NOOP;
+				});
+			} catch (e) {
+				frameOpen = false;
+				counts.opened--;
+				openedBy = null;
+				// undoTriggers may have created triggers inside the rolled-back transaction: check again next time.
+				undoSchemaSig = null;
+				setupDone = false;
+				if (e !== NOOP) throw e;
+				counts.noop++;
+			}
+			return result;
 		},
 		/** After a statement: a write while armed with no frame open is a MISS, counted and logged. */
 		afterStatement(db, sql, rowsWritten) {

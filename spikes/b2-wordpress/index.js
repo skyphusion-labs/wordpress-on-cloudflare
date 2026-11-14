@@ -2336,32 +2336,11 @@ function sqlStatement(db, m) {
 	stats.calls++;
 	try {
 		const params = sqlParams(m.params);
-		// #352: the request frame opens just before the first statement that may write (a DDL is a commit point).
-		if (undoLog) undoLog.beforeStatement(db, m.sql);
-		const returnsRows = /^\s*(SELECT|PRAGMA|WITH|VALUES|EXPLAIN)\b/i.test(m.sql) || /\bRETURNING\b/i.test(m.sql);
-		let reply;
-		if (returnsRows) {
-			const cur = db.exec(m.sql, ...params);
-			const rows = [...cur.raw()];
-			// Billed units (Durable Objects pricing): rows read and written.
-			stats.rowsRead += cur.rowsRead;
-			stats.rowsWritten += cur.rowsWritten;
-			if (undoLog) undoLog.afterStatement(db, m.sql, cur.rowsWritten);
-			let blob = false;
-			for (const row of rows) blob = sqlRow(row) || blob;
-			reply = { ok: true, columns: cur.columnNames || [], rows, changes: 0, last_row_id: 0, blob };
-		} else {
-			let changes = 0;
-			changes = sqlChanges(db, () => {
-				const cur = db.exec(m.sql, ...params);
-				cur.toArray();
-				stats.rowsRead += cur.rowsRead;
-				stats.rowsWritten += cur.rowsWritten;
-				if (undoLog) undoLog.afterStatement(db, m.sql, cur.rowsWritten);
-			});
-			const insert = changes > 0 && /^\s*(INSERT|REPLACE)\b/i.test(m.sql);
-			reply = { ok: true, columns: [], rows: [], changes, last_row_id: insert ? db.exec('SELECT last_insert_rowid()').raw().next().value[0] : 0 };
-		}
+		// #352: the statement runs through the undo log. The request frame opens with the first statement that
+		// changes a row, in one storage transaction with it; a statement that changes nothing takes the open
+		// back (a DDL is a commit point).
+		const run = () => sqlRun(db, m, params);
+		const { reply } = undoLog ? undoLog.statement(db, sqlStorage, m.sql, run) : run();
 		stats.ms += Date.now() - t;
 		stats.log.push('ok  ' + m.sql.slice(0, 160).replace(/\s+/g, ' '));
 		return reply;
@@ -2372,6 +2351,37 @@ function sqlStatement(db, m) {
 		stats.log.push('ERR ' + m.sql.slice(0, 160).replace(/\s+/g, ' ') + ' => ' + error.slice(0, 120));
 		return { ok: false, error };
 	}
+}
+// One statement and its reply; rowsWritten is what the storage counted, for the undo log's no-op check.
+function sqlRun(db, m, params) {
+	const returnsRows = /^\s*(SELECT|PRAGMA|WITH|VALUES|EXPLAIN)\b/i.test(m.sql) || /\bRETURNING\b/i.test(m.sql);
+	let reply;
+	let rowsWritten = 0;
+	if (returnsRows) {
+		const cur = db.exec(m.sql, ...params);
+		const rows = [...cur.raw()];
+		// Billed units (Durable Objects pricing): rows read and written.
+		stats.rowsRead += cur.rowsRead;
+		stats.rowsWritten += cur.rowsWritten;
+		rowsWritten = cur.rowsWritten;
+		if (undoLog) undoLog.afterStatement(db, m.sql, cur.rowsWritten);
+		let blob = false;
+		for (const row of rows) blob = sqlRow(row) || blob;
+		reply = { ok: true, columns: cur.columnNames || [], rows, changes: 0, last_row_id: 0, blob };
+	} else {
+		let changes = 0;
+		changes = sqlChanges(db, () => {
+			const cur = db.exec(m.sql, ...params);
+			cur.toArray();
+			stats.rowsRead += cur.rowsRead;
+			stats.rowsWritten += cur.rowsWritten;
+			rowsWritten = cur.rowsWritten;
+			if (undoLog) undoLog.afterStatement(db, m.sql, cur.rowsWritten);
+		});
+		const insert = changes > 0 && /^\s*(INSERT|REPLACE)\b/i.test(m.sql);
+		reply = { ok: true, columns: [], rows: [], changes, last_row_id: insert ? db.exec('SELECT last_insert_rowid()').raw().next().value[0] : 0 };
+	}
+	return { reply, rowsWritten };
 }
 
 // Move a site in or out (DB_IN_DO). The dump is JSON lines: {"sql"} for each
@@ -3746,7 +3756,7 @@ async function handle(req, env, url, spikeOk, maxBody, ctx) {
 					...(booted && SITE_REMOTE ? { siteRemote: siteState } : {}), // #569: the remote site packs at this boot
 					// #352: this request's frame: opened (the first write armed it), commit points, misses, and the
 					// rows its PHP transactions undid. Only with REQUEST_FRAMES=on.
-					...(env.REQUEST_FRAMES === 'on' && undoLog && frame0 ? (() => { const c = undoLog.counts(); return { frame: { opened: c.opened - frame0.opened, kept: c.kept - frame0.kept, points: c.points - frame0.points, miss: c.miss - frame0.miss, ...(c.opened > frame0.opened ? { by: undoLog.openedBy() } : {}) } }; })() : {}),
+					...(env.REQUEST_FRAMES === 'on' && undoLog && frame0 ? (() => { const c = undoLog.counts(); return { frame: { opened: c.opened - frame0.opened, kept: c.kept - frame0.kept, points: c.points - frame0.points, miss: c.miss - frame0.miss, noop: c.noop - frame0.noop, ...(c.opened > frame0.opened ? { by: undoLog.openedBy() } : {}) } }; })() : {}),
 					// #569: site pack fetches this request (subrequests, the one retry included), KiB, ms,
 					// the failed ones (an honest 500 if PHP required the file), the retries, the opens past
 					// the hard cap, the distinct packs, and the held high-water (the hot pack not included).

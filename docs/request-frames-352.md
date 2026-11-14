@@ -15,12 +15,22 @@ lost). The fix-build admin round had 46 of 47 deaths with `x-write-loss` 1 or 3:
 
 ## The frame
 
-- **Lazy (ruling (i)).** Each PHP request in the object is ARMED. The frame OPENS just before the
-  request's first statement that may write, whatever the method. `index.js` `sqlStatement` calls
-  `beforeStatement` for every PHP statement.
-  - `mayWrite` is conservative: only a plain `SELECT` or `EXPLAIN` and a query `PRAGMA` are reads.
-  - A request that never writes pays nothing. `post-new.php`, which inserts an auto-draft on a GET,
-    is covered.
+- **Lazy (ruling (i)).** Each PHP request in the object is ARMED. The frame OPENS with the request's
+  first statement that CHANGES a row, whatever the method. `index.js` `sqlStatement` runs every PHP
+  statement through `undoLog.statement()`.
+  - `mayWrite` is conservative: everything may write except a plain `SELECT` or `EXPLAIN` and the
+    statements that change no covered row: any `PRAGMA` (a setter too), `VACUUM`, `ANALYZE`, `REINDEX`.
+    CI at `105776b` showed a `PRAGMA` setter opening the frame of 10 of 10 public GETs.
+  - For a statement that may write, the open, the statement and its first undo row run in ONE
+    `storage.transactionSync`. If the statement left no undo row and reported no row written (an
+    `UPDATE` or `DELETE` that matched nothing, an `INSERT OR IGNORE` that conflicted), the transaction
+    is rolled back: the open is never committed (`x-perf` `frame.noop`). What PHP sees is identical to
+    frames off (`changes` 0, no new insert id, no error). An undo row decides, not the reported count
+    alone, so a counter that under-reports cannot drop a frame that covers a real change.
+  - A `PRAGMA` never runs inside that transaction: SQLite ignores `PRAGMA foreign_keys` in one, so a
+    setter would silently not take effect (a unit test pins this; it was red before the fix).
+  - A request that never changes a row pays nothing. `post-new.php`, which inserts an auto-draft on a
+    GET, is covered.
 - **The miss guard.** A statement that writes rows (`cursor.rowsWritten`) while armed with no frame open
   is a counted, logged `frame-miss`, never silent.
 - **Kept.** When PHP finishes, a fatal included (ruling (ii): autocommit semantics). The frame hides OUR
