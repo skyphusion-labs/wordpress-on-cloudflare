@@ -393,6 +393,12 @@ jobs:
         # Boots the loader the step above built with USE_ZEND_ALLOC 0 and 1; each reader must tell them apart.
         working-directory: spikes/b2-wordpress
         run: node --test tests/allocator-reading.test.mjs
+      - name: OPcache files fetched while PHP pauses in open(), fail clean, default off (issue #563)
+        # The real loader and PHP: a remote OPcache pack is used only when fetched and checked; a 404,
+        # a short pack, a SHA-256 mismatch and the fetch cap each give a clean compile from source; a
+        # loader copy without the import-pattern edit must NOT use the pack; no hook, no wrapped open().
+        working-directory: spikes/b2-wordpress
+        run: node --test tests/opcache-remote.test.mjs
   coverage:
     runs-on: ubuntu-latest
     steps:

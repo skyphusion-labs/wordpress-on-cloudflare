@@ -10,7 +10,8 @@ _build/inputs.json (#379):
     _build/artifact/<build id>.tar.gz
         build/build-id.js      the build id (the #465 guard reads it)
         build/<imported>       each file a root source imports as ./build/<path> (site.zip,
-                               opcache.zip, opcache-boot-index.js, build-id.js today)
+                               opcache.zip, opcache-boot-index.js, opcache-remote-index.js,
+                               build-id.js today)
         build/public/          the static assets (with the _pf/ OPcache boot packs, #394)
         vendor/                the PHP wasm and its loader
         *.js *.mjs package.json package-lock.json   the Worker sources at the app root

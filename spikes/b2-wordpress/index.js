@@ -41,6 +41,10 @@ import opcacheZip from './build/opcache.zip';
 // fetched from the Assets binding when a runtime boots and dropped after that request. null when
 // the build was not split (build.sh writes the default).
 import OPCACHE_BOOT from './build/opcache-boot-index.js';
+// #563 (#394 Gate 1, OPCACHE_REMOTE=1): the WARM OPcache files in static-asset packs, fetched when PHP
+// opens one (remote-packs.mjs). null on a default build (build.sh writes it): nothing changes then.
+import OPCACHE_REMOTE from './build/opcache-remote-index.js';
+import { createRemotePacks, REMOTE_FETCH_CAP } from './remote-packs.mjs';
 // The build id baked at build time (build.sh writes build/build-id.js), so the
 // object can report which code version it runs (issue #35 slice 5).
 import BUILD_ID from './build/build-id.js';
@@ -371,7 +375,7 @@ async function stageUpload(req, env) {
 }
 
 function newStats() {
-	return { calls: 0, ms: 0, failures: [], log: [], r2: {}, rowsRead: 0, rowsWritten: 0, inflates: 0, inflateBytes: 0, reinflates: 0, lazyWrites: 0, dbTables: {}, ocGroups: {}, ocCalls: 0, ocHits: 0, httpCalls: 0, httpMs: 0, txnOps: 0, undoRows: 0 };
+	return { calls: 0, ms: 0, failures: [], log: [], r2: {}, rowsRead: 0, rowsWritten: 0, inflates: 0, inflateBytes: 0, reinflates: 0, lazyWrites: 0, rfN: 0, rfBytes: 0, rfMs: 0, rfFail: 0, rfCapped: 0, dbTables: {}, ocGroups: {}, ocCalls: 0, ocHits: 0, httpCalls: 0, httpMs: 0, txnOps: 0, undoRows: 0 };
 }
 
 // Every statement failure goes through here. resetFailTotal counts the isolate memory resets among
@@ -456,6 +460,32 @@ const tracing = () => Boolean(ENV && ENV.FILE_TRACE === 'on');
 let inflatedBytes = 0;
 // #394 L1: the boot pack's file nodes, mounted for one request when a runtime boots.
 let bootPackPaths = null;
+// #563: the remote OPcache packs of the runtime booted last (null: none), and what its boot did with
+// them, for x-perf (remote): 'packs <n> files', 'off', 'fallback:no-assets-binding', or 'none'.
+let remotePacks = null;
+let remoteState = 'none';
+const remoteOn = () => Boolean(OPCACHE_REMOTE && ENV && ENV.OPCACHE_REMOTE !== 'off');
+// The loader's open() asks this first (prepare.sh, #563). null: open now. A promise: PHP waits for the
+// pack; if it rejects, the open fails with EIO and OPcache compiles the script from source.
+function remoteOpenHook(path) {
+	if (!remotePacks || path.length <= OPCACHE_DIR.length + 1 || !path.startsWith(OPCACHE_DIR + '/')) return null;
+	return remotePacks.open(path.slice(OPCACHE_DIR.length + 1));
+}
+async function fetchRemotePack(name) {
+	const r = await ENV.ASSETS.fetch(new Request('https://assets.local/_pf/' + OPCACHE_REMOTE.id + '/' + name));
+	if (!r.ok) throw new Error(name + ' answered ' + r.status);
+	return new Uint8Array(await r.arrayBuffer());
+}
+// A node per remote file: its size is known at once (stat needs no bytes), its contents come from
+// the held pack. A read with the pack not held fails with EIO (the open fetches it first).
+function remoteFile(FS, path, name, size) {
+	FS.writeFile(path, new Uint8Array(0));
+	attachLazyContents(FS.lookupPath(path).node, size, (out) => {
+		const b = remotePacks && remotePacks.data(name, out);
+		if (!b) throw new FS.ErrnoError(29);
+		return b;
+	}, { src: 'opcache', path });
+}
 // What the last boot did with the boot pack, for x-perf (l1): 'assets', 'fallback:<why>', or 'none'.
 let l1State = 'none';
 async function loadBootPacks() {
@@ -1297,6 +1327,8 @@ async function boot(origin) {
 		// into an outbound WebSocket that php-wasm cannot poll in workerd, and the documented contract
 		// is that outbound traffic goes through the WordPress HTTP API and its host allowlist.
 		websocket: { decorator: refuseSocketsDecorator((info) => console.log(JSON.stringify({ m: 'socket', refused: info }))) },
+		// #563: only on an OPCACHE_REMOTE build. Without it the loader does not wrap open() at all.
+		...(remoteOn() ? { pagefeatherOpen: remoteOpenHook } : {}),
 	});
 	const php = new PHP(id);
 	lastBootedPhp = php;
@@ -1407,6 +1439,27 @@ async function boot(origin) {
 		if (e.method === 0) FS.writeFile(full, e.data(), { canOwn: true });
 		else lazyFile(FS, full, e, 'opcache');
 		opcacheFiles++;
+	}
+	// #563: the WARM OPcache files of an OPCACHE_REMOTE build, as remote nodes (opcache.zip is empty then).
+	remotePacks = null;
+	remoteState = OPCACHE_REMOTE ? 'none' : 'none:not-built';
+	if (OPCACHE_REMOTE && ENV.OPCACHE_REMOTE === 'off') remoteState = 'off';
+	else if (OPCACHE_REMOTE && !ENV.ASSETS) {
+		// No pack can be fetched: the warm scripts compile from source (OPcache's normal path). Said loudly.
+		remoteState = 'fallback:no-assets-binding';
+		console.error(JSON.stringify({ m: 'remote', fallback: 'compile', why: 'no ASSETS binding' }));
+	} else if (OPCACHE_REMOTE) {
+		const capRaw = Number(ENV.REMOTE_FETCH_CAP);
+		const cap = Number.isInteger(capRaw) && capRaw >= 0 && capRaw <= 1000 ? capRaw : REMOTE_FETCH_CAP;
+		remotePacks = createRemotePacks({ index: OPCACHE_REMOTE, fetchPack: fetchRemotePack, parse: zipEntries, stats, cap, log: (o) => console.error(JSON.stringify(o)) });
+		let n = 0;
+		for (const [name, [, size]] of Object.entries(OPCACHE_REMOTE.files)) {
+			const full = OPCACHE_DIR + '/' + name;
+			mkdirp(full.slice(0, full.lastIndexOf('/')));
+			remoteFile(FS, full, name, size);
+			n++;
+		}
+		remoteState = `packs ${OPCACHE_REMOTE.packs.length} files ${n} cap ${cap}`;
 	}
 	const tFiles = Date.now() - t0 - tWasm;
 	memAt.afterFiles = mem();
@@ -2907,6 +2960,7 @@ async function runCron(booted, cleanDue = false, mail = null) {
 		} finally {
 			tickMail = null;
 			evictLazy();
+			if (remotePacks) remotePacks.endRequest(); // #563: held packs live for one request
 			dropBootPack(php[__private__dont__use].FS); // #394 L1: a cron run that booted drops the boot files too
 		}
 		let out = {};
@@ -3411,7 +3465,7 @@ async function handle(req, env, url, spikeOk, maxBody, ctx) {
 			const { php, handler, bootMs } = await bootPromise;
 			const bootWaitMs = Date.now() - tBoot;
 			const wasm0 = php[__private__dont__use].HEAPU8.length;
-			const start = { dbTables: { ...stats.dbTables }, ocGroups: { ...stats.ocGroups }, calls: stats.calls, ms: stats.ms, fail: stats.failures.length, log: stats.log.length, rowsRead: stats.rowsRead, rowsWritten: stats.rowsWritten, inflates: stats.inflates, inflateBytes: stats.inflateBytes, reinflates: stats.reinflates, lazyWrites: stats.lazyWrites, ocCalls: stats.ocCalls, ocHits: stats.ocHits, httpCalls: stats.httpCalls, txnOps: stats.txnOps, undoRows: stats.undoRows };
+			const start = { dbTables: { ...stats.dbTables }, ocGroups: { ...stats.ocGroups }, calls: stats.calls, ms: stats.ms, fail: stats.failures.length, log: stats.log.length, rowsRead: stats.rowsRead, rowsWritten: stats.rowsWritten, inflates: stats.inflates, inflateBytes: stats.inflateBytes, reinflates: stats.reinflates, lazyWrites: stats.lazyWrites, rfN: stats.rfN, rfBytes: stats.rfBytes, rfMs: stats.rfMs, rfFail: stats.rfFail, rfCapped: stats.rfCapped, ocCalls: stats.ocCalls, ocHits: stats.ocHits, httpCalls: stats.httpCalls, txnOps: stats.txnOps, undoRows: stats.undoRows };
 			const delta = () => ({ calls: stats.calls - start.calls, ms: stats.ms - start.ms, failures: stats.failures.slice(start.fail), log: stats.log.slice(start.log) });
 			const t0 = Date.now();
 			if (url.pathname === '/_install') {
@@ -3525,6 +3579,7 @@ async function handle(req, env, url, spikeOk, maxBody, ctx) {
 			globalThis.__lastRequest = { url: url.pathname, status: r.httpStatusCode, ...d };
 			if (tracing()) fileTrace.end({ status: r.httpStatusCode });
 			evictLazy();
+			if (remotePacks) remotePacks.endRequest(); // #563: held packs live for one request
 			dropBootPack(php[__private__dont__use].FS); // #394 L1: the boot files are no longer needed
 			const wasmBytes = php[__private__dont__use].HEAPU8.length;
 			out.set('x-wasm-mib', String(Math.round(wasmBytes / 1048576)));
@@ -3563,6 +3618,10 @@ async function handle(req, env, url, spikeOk, maxBody, ctx) {
 					wasm0MiB: Math.round(wasm0 / 1048576),
 					wasm1MiB: Math.round(wasmBytes / 1048576),
 					...(booted ? { l1: l1State } : {}), // #394 L1: where this boot's OPcache boot pack came from
+					...(booted && OPCACHE_REMOTE ? { remote: remoteState } : {}), // #563: the remote OPcache packs at this boot
+					// #563: remote OPcache pack fetches this request (each one is a subrequest), their KiB and ms,
+					// the failed ones (a clean miss: OPcache compiled from source) and the opens past the cap.
+					...(OPCACHE_REMOTE ? { rfN: stats.rfN - start.rfN, rfKiB: Math.round((stats.rfBytes - start.rfBytes) / 1024), rfMs: stats.rfMs - start.rfMs, rfFail: stats.rfFail - start.rfFail, rfCapped: stats.rfCapped - start.rfCapped } : {}),
 					...(ledgerActive ? { mem: ledgerSnapshot('end') } : {}), // #394: the isolate memory ledger
 					bytes: r.bytes.length,
 					httpCalls: stats.httpCalls - start.httpCalls,
