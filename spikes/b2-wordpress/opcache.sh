@@ -11,6 +11,7 @@ python3 -c "import zipfile; zipfile.ZipFile('build/opcache.zip', 'w').close()"
 # #394 L1: priming runs unsplit; a split from an earlier run would point at other files.
 rm -f build/opcache-boot.zip
 echo 'export default null;' > build/opcache-boot-index.js
+echo 'export default null;' > build/opcache-remote-index.js  # #563: priming runs with no remote packs
 rm -rf build/public/_pf
 # A fresh, empty local state for every run (#313). With the default .wrangler/state, WooCommerce
 # was primed whenever an EARLIER run on this machine had left it active, so the same tree made a

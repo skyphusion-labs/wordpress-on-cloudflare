@@ -114,6 +114,8 @@ python3 -c "import zipfile; zipfile.ZipFile('build/opcache.zip', 'w').close()"
 # index.js's import of the index resolves on every build. There is no fallback module (#411).
 rm -f build/opcache-boot.zip
 echo 'export default null;' > build/opcache-boot-index.js
+# #563: no remote OPcache packs until opcache-split.py --remote runs (OPCACHE_REMOTE=1 in the deploy).
+echo 'export default null;' > build/opcache-remote-index.js
 echo "public/ $(find build/public -type f | wc -l | tr -d ' ') files"
 # The build id (build-id.sh): the git sha, -dirty, the content id and -wooprimed (#377).
 BUILD_ID=$(./build-id.sh "$wp/wp-content")

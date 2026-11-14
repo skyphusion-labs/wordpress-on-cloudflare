@@ -137,6 +137,8 @@ jobs:
         run: node --test spikes/b2-wordpress/tests/file-trace.test.mjs
       - name: b-dosql OPcache split into warm and boot (issue #394 L1)
         run: python3 -I spikes/b2-wordpress/tests/opcache-split-test.py
+      - name: b-dosql every OPcache file to packs in cold-boot read order, opcache.zip empty, no boot pack (issue #563)
+        run: python3 -I spikes/b2-wordpress/tests/opcache-remote-pack-test.py
       - name: measure394 read-back states, a failed read is never an absent row (issue #519)
         run: python3 -I spikes/b2-wordpress/tests/measure394-state-test.py
       - name: b-dosql runtime guards, raw sockets and PHP messages (issue #452)
@@ -393,6 +395,12 @@ jobs:
         # Boots the loader the step above built with USE_ZEND_ALLOC 0 and 1; each reader must tell them apart.
         working-directory: spikes/b2-wordpress
         run: node --test tests/allocator-reading.test.mjs
+      - name: OPcache files fetched while PHP pauses in open(), fail clean, a streaming held budget, default off (issue #563)
+        # The real loader and PHP: a remote OPcache pack is used only when fetched and checked; a 404,
+        # a short pack, a SHA-256 mismatch and the fetch cap each give a clean compile from source; a
+        # loader copy without the import-pattern edit must NOT use the pack; no hook, no wrapped open().
+        working-directory: spikes/b2-wordpress
+        run: node --test tests/opcache-remote.test.mjs tests/remote-packs.test.mjs
   coverage:
     runs-on: ubuntu-latest
     steps:

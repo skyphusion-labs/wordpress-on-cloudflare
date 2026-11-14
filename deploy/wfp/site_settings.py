@@ -43,7 +43,7 @@ RECORD = "_build/settings.json"
 # The env-only settings render_user reads (lib.sh), each rendered as a [vars] name of its own.
 SETTINGS = ("PHP_INI", "LAZY_CACHE_MB", "LAZY_ARENA", "LAZY_ARENA_MB", "PHP_RECYCLE", "CRON_INTERVAL_MS",
             "TURNSTILE_SITEKEY", "TURNSTILE_WOO", "TURNSTILE_LOGIN", "TURNSTILE_COMMENTS",
-            "MAIL_FROM", "MAIL_FROM_NAME", "PHP_LOCATION", "WP_VECTORIZE_SEARCH", "OPCACHE_SPLIT")
+            "MAIL_FROM", "MAIL_FROM_NAME", "PHP_LOCATION", "WP_VECTORIZE_SEARCH", "OPCACHE_SPLIT", "OPCACHE_REMOTE")
 # Measurement flags: never recorded, never kept, by design (the lead's ruling on #561). Silent
 # persistence is the dangerous direction for them; silently going off is the safe one. A run that
 # exports one turns it on for that upload; the next update without it turns it OFF, and says so.
@@ -61,7 +61,7 @@ SECRETS = ("TURNSTILE_SECRET",)
 # bindings (AI and the index; ASSETS), not a var: the record keeps those.
 DROPPABLE_VARS = ("PHP_INI", "LAZY_CACHE_MB", "LAZY_ARENA", "LAZY_ARENA_MB", "PHP_RECYCLE", "CRON_INTERVAL_MS",
                   "TURNSTILE_SITEKEY", "TURNSTILE_WOO", "TURNSTILE_LOGIN", "TURNSTILE_COMMENTS",
-                  "MAIL_FROM_NAME")
+                  "MAIL_FROM_NAME", "OPCACHE_REMOTE")  # OPCACHE_REMOTE renders the var only when on (#563)
 
 
 def drop_list(env=os.environ):

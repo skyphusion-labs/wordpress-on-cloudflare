@@ -88,6 +88,47 @@ s = s.replace(old, new)
 open(p, 'w').write(s)
 PY4
 
+# PHP pauses in open() while the Worker fetches a file (#563, #394 Gate 1, Path A). Under JSPI an import
+# may suspend only if the loader wraps it in WebAssembly.Suspending, and the loader picks those imports
+# in JS, by name (Asyncify.instrumentWasmImports): the wasm needs no change. Two edits:
+# 1. __syscall_openat is wrapped, ONLY when the runtime was given a pagefeatherOpen hook (the
+#    OPCACHE_REMOTE build). Without the hook nothing is wrapped, so a default build runs as before.
+# 2. ___syscall_openat asks the hook first. A promise means the bytes are not here yet: PHP waits, then
+#    the open runs as usual. A rejected promise fails the open with EIO (29), never a half file.
+# Measured 2026-11-14 on production workerd (#394 issuecomment-6878010968): require, require_once from an
+# autoloader, require inside try and file_get_contents all paused and resumed; a copy without edit 1 failed.
+python3 - <<'PY5'
+p = 'vendor/php_8_3.js'; s = open(p).read()
+old = "\t\t\t\t\tlet isAsyncifyImport =\n\t\t\t\t\t\toriginal.isAsync || importPattern.test(x);\n"
+new = ("\t\t\t\t\tlet isAsyncifyImport =\n\t\t\t\t\t\toriginal.isAsync || importPattern.test(x) ||\n"
+       "\t\t\t\t\t\t// Pagefeather (#563): open() may pause, only when a pagefeatherOpen hook is set.\n"
+       "\t\t\t\t\t\t(x === '__syscall_openat' && typeof Module['pagefeatherOpen'] == 'function');\n")
+assert s.count(old) == 1, 'openat import pattern patch did not apply'
+s = s.replace(old, new)
+old = "\t\t\tvar mode = varargs ? syscallGetVarargI() : 0;\n\t\t\treturn FS.open(path, flags, mode).fd;\n"
+new = """\t\t\tvar mode = varargs ? syscallGetVarargI() : 0;
+\t\t\t// Pagefeather (#563): a promise from the hook means the file's bytes are being fetched.
+\t\t\tvar pfWait = Module['pagefeatherOpen'] ? Module['pagefeatherOpen'](path) : null;
+\t\t\tif (pfWait) {
+\t\t\t\treturn pfWait.then(
+\t\t\t\t\t() => {
+\t\t\t\t\t\ttry {
+\t\t\t\t\t\t\treturn FS.open(path, flags, mode).fd;
+\t\t\t\t\t\t} catch (e) {
+\t\t\t\t\t\t\tif (typeof FS == 'undefined' || !(e.name === 'ErrnoError')) throw e;
+\t\t\t\t\t\t\treturn -e.errno;
+\t\t\t\t\t\t}
+\t\t\t\t\t},
+\t\t\t\t\t() => -29
+\t\t\t\t);
+\t\t\t}
+\t\t\treturn FS.open(path, flags, mode).fd;
+"""
+assert s.count(old) == 1, 'openat hook patch did not apply'
+s = s.replace(old, new)
+open(p, 'w').write(s)
+PY5
+
 # The module reserves 64 MiB (1024 pages) at start. A Worker isolate has 128 MB
 # for everything, so start at 24 MiB (384 pages) and let it grow on demand.
 # Its static data ends at 12.4 MiB. Both values are 2-byte LEB128, so the patch
