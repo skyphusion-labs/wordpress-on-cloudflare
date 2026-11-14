@@ -184,5 +184,11 @@ ok "OPCACHE_REMOTE=1 (unsplit) renders the var" "$(OPCACHE_REMOTE=1 OPCACHE_SPLI
 ok "OPCACHE_REMOTE=1 (unsplit): the ASSETS binding and run_worker_first /_pf/*" "$(OPCACHE_REMOTE=1 OPCACHE_SPLIT=0 render_user one https://wp-one.sub.workers.dev | assets | grep -qx '{"binding": "ASSETS", "directory": "build/public", "run_worker_first": \["/_pf/\*"\]}' && echo 1 || echo 0)"
 ok "OPCACHE_REMOTE=1 with OPCACHE_SPLIT=1 fails the render (no split coupling)" "$(OPCACHE_REMOTE=1 OPCACHE_SPLIT=1 render_user one https://wp-one.sub.workers.dev >/dev/null 2>&1 && echo 0 || echo 1)"
 for bad in 2 on yes; do ok "OPCACHE_REMOTE=$bad fails the render" "$(OPCACHE_REMOTE=$bad render_user one https://wp-one.sub.workers.dev >/dev/null 2>&1 && echo 0 || echo 1)"; done
+# SITE_REMOTE (#569): site.zip remote too. Only on top of OPCACHE_REMOTE=1 (its ASSETS binding, /_pf/ first).
+sr() { "$PY" -c 'import json, sys, tomllib; print(json.dumps(tomllib.loads(sys.stdin.read())["vars"].get("SITE_REMOTE")))'; }
+ok "no SITE_REMOTE var by default" "$(env -u SITE_REMOTE OPCACHE_REMOTE=1 OPCACHE_SPLIT=0 bash -c ". '$LIB'; render_user one https://wp-one.sub.workers.dev" | sr | grep -qx 'null' && echo 1 || echo 0)"
+ok "SITE_REMOTE=1 with OPCACHE_REMOTE=1 renders it" "$(SITE_REMOTE=1 OPCACHE_REMOTE=1 OPCACHE_SPLIT=0 render_user one https://wp-one.sub.workers.dev | sr | grep -qx '"on"' && echo 1 || echo 0)"
+ok "SITE_REMOTE=1 without OPCACHE_REMOTE=1 fails the render" "$(SITE_REMOTE=1 OPCACHE_REMOTE=0 render_user one https://wp-one.sub.workers.dev >/dev/null 2>&1 && echo 0 || echo 1)"
+for bad in 2 on yes; do ok "SITE_REMOTE=$bad fails the render" "$(SITE_REMOTE=$bad OPCACHE_REMOTE=1 render_user one https://wp-one.sub.workers.dev >/dev/null 2>&1 && echo 0 || echo 1)"; done
 echo "$fails failing check(s)"
 exit $fails
