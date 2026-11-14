@@ -167,6 +167,8 @@ jobs:
         run: node --test spikes/b2-wordpress/tests/lazy-write.test.mjs
       - name: b-dosql the headroom probe streams its reach, off by default (issue #394)
         run: node --test spikes/b2-wordpress/tests/headroom.test.mjs
+      - name: b-dosql a dropped runtime is released once nothing uses it (issue #566)
+        run: node --expose-gc --test spikes/b2-wordpress/tests/drop-runtime.test.mjs
       - name: b-dosql the lazy inflate cache defaults to 2 MiB (issue #394)
         run: node --test spikes/b2-wordpress/tests/lazy-cache-default.test.mjs
       - name: b-dosql x-perf isoAgeS is the isolate age (issue #474)
