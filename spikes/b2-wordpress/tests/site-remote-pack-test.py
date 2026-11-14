@@ -72,6 +72,8 @@ with tempfile.TemporaryDirectory() as d:
     ok('the directories are kept, the empty uploads/ too', 'wordpress/wp-content/uploads' in idx.get('dirs', []) and 'wordpress/wp-admin' in idx.get('dirs', []))
     ok('the bytes are unchanged', bool(idx['packs']) and all(
         (zipfile.ZipFile(os.path.join(pdir, hot['name'] if idx['files'][n][0] == -1 else idx['packs'][idx['files'][n][0]]['name'])).read(n) == files[n]) for n in files))
+    sc = idx.get('selfcheck') or [None, None, None]
+    ok('the boot self-check names a small .php, with its size and SHA-256', bool(sc[0]) and sc[0].endswith('.php') and sc[1] == len(files[sc[0]]) and sc[2] == hashlib.sha256(files[sc[0]]).hexdigest())
     ok('the OPcache pack beside them is NOT touched', open(os.path.join(pdir, 'oc-0.zip'), 'rb').read() == b'opcache pack')
     ok('a stale site pack of an earlier run is removed', not os.path.exists(os.path.join(pdir, 'st-9.zip')))
 with tempfile.TemporaryDirectory() as d:

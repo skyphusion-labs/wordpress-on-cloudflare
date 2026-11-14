@@ -1,17 +1,11 @@
-// node --test spikes/b2-wordpress/tests/site-remote.test.mjs (#569, #394 Gate 2). Needs npm ci and
-// ./prepare.sh (vendor/php_8_3.js, vendor/php_8_3.wasm), on a Node with JSPI (CI: Node 24).
+// node --test spikes/b2-wordpress/tests/site-remote.test.mjs (#569, #394 Gate 2, the HYBRID). Needs npm
+// ci and ./prepare.sh (vendor/php_8_3.js with PY5 and PY6), on a Node with JSPI (CI: Node 24).
 //
-// The real loader, the real PHP, the REAL attachLazyContents (cut out of index.js, as
-// lazy-write.test.mjs does) and remote-packs.mjs. Site files live only in packs. The evictor drops
-// every earlier inflated copy as soon as another file inflates, the most aggressive the 2 MiB cap
-// can be, and the held budget keeps one pack. So any read that is not protected by the PIN finds
-// both its bytes and its pack gone. Cases:
-//   - require, include and file_get_contents of remote site files work;
-//   - one failed pack fetch is retried once and the page is whole (rsRetry 1);
-//   - two failures: include returns false, require is a fatal (exit 255), never the text after it;
-//   - a file_exists / is_file / is_readable / filesize / scandir storm makes 0 fetches;
-//   - an OPEN file read half, then other packs, then the rest: every byte, exactly (the pin);
-//     the same with the pin turned off must NOT give the whole file (the guard can fail).
+// The real loader, PHP, attachLazyContents (cut from index.js) and remote-packs.mjs createSiteHooks.
+// The hybrid (Gate 0b and step 3, #394 issuecomment-6879785529 and -6879862441): a .php is fetched at
+// its FIRST READ (OPcache opens sources it never reads: 37,721 of 37,721 opened-not-read files were
+// .php); every other site file at its OPEN (a failure stays a clean false). The evictor drops every
+// other copy after each inflate and the held budget keeps one pack, so only the pin keeps bytes.
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { readFileSync, writeFileSync, mkdtempSync, rmSync } from 'node:fs';
@@ -20,17 +14,22 @@ import { createHash } from 'node:crypto';
 import { tmpdir } from 'node:os';
 import { join, dirname } from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { createRemotePacks, createFetchBudget } from '../remote-packs.mjs';
+import { createRemotePacks, createFetchBudget, createSiteHooks } from '../remote-packs.mjs';
 import { createArena } from '../inflate-arena.mjs';
 
 const B2 = join(dirname(fileURLToPath(import.meta.url)), '..');
 const require = createRequire(join(B2, 'package.json'));
 globalThis.require ??= require;
-const { loadPHPRuntime, PHP, __private__dont__use } = require('@php-wasm/universal');
+const { loadPHPRuntime, PHP, setPhpIniEntries, __private__dont__use } = require('@php-wasm/universal');
 const { zipSync, unzipSync } = require('fflate');
 
 const dir = mkdtempSync(join(tmpdir(), 'site569-'));
-writeFileSync(join(dir, 'fixed.mjs'), readFileSync(join(B2, 'vendor/php_8_3.js'), 'utf8'));
+const loaderSrc = readFileSync(join(B2, 'vendor/php_8_3.js'), 'utf8');
+writeFileSync(join(dir, 'fixed.mjs'), loaderSrc);
+// The red control: no read path may suspend (PY6's pattern edit undone, js_fd_read out of the stock list).
+const PY6_PAT = "((x === 'fd_read' || x === '_mmap_js') && typeof Module['pagefeatherRead'] == 'function')";
+assert.ok(loaderSrc.includes(PY6_PAT), 'prepare.sh PY6 is in the loader');
+writeFileSync(join(dir, 'noread.mjs'), loaderSrc.split(PY6_PAT).join('false').replace('/^(js_open_process|js_fd_read|', '/^(js_open_process|'));
 const wasm = new WebAssembly.Module(readFileSync(join(B2, 'vendor/php_8_3.wasm')));
 test.after(() => rmSync(dir, { recursive: true, force: true }));
 
@@ -45,25 +44,32 @@ function cut(src, header) {
 	}
 	throw new Error('unbalanced: ' + header);
 }
-// attachLazyContents from index.js. noteInflated drops EVERY earlier copy at once (the evictor).
-function attacher(arena) {
+// noPin: the REAL attachLazyContents with only its pin COUNT removed (every "pins++;" deleted). The fetch
+// modes stay as they are, so the control isolates the pin itself.
+function attacher(arena, { noPin = false } = {}) {
 	const stats = { reinflates: 0, inflates: 0, inflateBytes: 0, lazyWrites: 0 };
 	let noted = [];
 	const noteInflated = (drop) => { for (const d of noted) if (d !== drop) d(); noted = [drop]; };
+	let src = cut(indexSrc, 'function attachLazyContents(node, size, dataFn, tag) {');
+	if (noPin) {
+		assert.ok(src.includes('pins++;'), 'the pin count is in attachLazyContents');
+		src = src.split('pins++;').join('');
+	}
 	return new Function('stats', 'tracing', 'fileTrace', 'arenaOn', 'getArena', 'noteInflated',
-		cut(indexSrc, 'function attachLazyContents(node, size, dataFn, tag) {') + '\nreturn attachLazyContents;')(
+		src + '\nreturn attachLazyContents;')(
 		stats, () => false, null, () => !!arena, () => arena, noteInflated);
 }
 
-// The site: four packs, one file group each, plus a hot pack. big.txt is 200,000 bytes, so PHP
-// reads it in 8 KiB chunks: a read past the first chunk needs the bytes again.
 const enc = (s) => new TextEncoder().encode(s);
 const BIG = enc(Array.from({ length: 20000 }, (_, i) => String(i % 10).repeat(9) + '\n').join(''));
+const BIGJ = enc('{"x":"' + 'j'.repeat(150000) + '"}');
 const groups = [
-	{ 'wordpress/big.txt': BIG, 'wordpress/a.php': enc('<?php return "A";') },
+	{ 'wordpress/big.php': enc('<?php /*' + new TextDecoder().decode(BIG) + '*/ return "BIG";'), 'wordpress/a.php': enc('<?php return "A";') },
 	{ 'wordpress/b.php': enc('<?php return "B";') },
-	{ 'wordpress/c.php': enc('<?php return "C";') },
-	{ 'wordpress/d.json': enc('{"d":4}') },
+	{ 'wordpress/c.json': enc('{"c":3}'), 'wordpress/big.json': BIGJ },
+	{ 'wordpress/t.php': enc('<?php return "NEW";') },
+	{ 'wordpress/e.php': enc('<?php return "E";'), 'wordpress/e.json': enc('{"e":5}') },
+	{ 'wordpress/f.php': enc('<?php return "F";'), 'wordpress/f.json': enc('{"f":6}') },
 ];
 const hotFiles = { 'wordpress/theme.json': enc('{"hot":1}') };
 const zips = groups.map((g) => zipSync(g, { level: 6 }));
@@ -77,11 +83,22 @@ const INDEX = {
 		...groups.flatMap((g, i) => Object.entries(g).map(([n, b]) => [n, [i, b.length]])),
 		...Object.entries(hotFiles).map(([n, b]) => [n, [-1, b.length]]),
 	]),
-	dirs: ['wordpress', 'wordpress/empty'],
+	dirs: ['wordpress'],
 };
 const parse = (bytes) => Object.entries(unzipSync(bytes)).map(([name, b]) => ({ name, data: () => b }));
+const OC = '/internal/shared/opcache';
+const INI = { 'opcache.enable': '1', 'opcache.enable_cli': '1', 'opcache.file_cache': OC, 'opcache.file_cache_only': '1', 'opcache.validate_timestamps': '0', 'opcache.file_update_protection': '0' };
 
-async function site({ fail = () => false, pin = true, arena = null } = {}) {
+async function bootPHP(file, hooks) {
+	const loader = await import(join(dir, file));
+	const id = await loadPHPRuntime(loader, {
+		ENV: { USE_ZEND_ALLOC: '0' }, ...hooks,
+		instantiateWasm(imports, done) { const inst = new WebAssembly.Instance(wasm, imports); done(inst, wasm); return inst.exports; },
+	});
+	return new PHP(id);
+}
+
+async function site({ fail = () => false, noPin = false, arena = null, file = 'fixed.mjs', opcache = null } = {}) {
 	const stats = {};
 	const fetched = [];
 	const remote = createRemotePacks({
@@ -93,15 +110,10 @@ async function site({ fail = () => false, pin = true, arena = null } = {}) {
 			return name === 'site-hot.zip' ? hotZip.slice() : zips[Number(name.slice(3, 4))].slice();
 		},
 	});
-	const loader = await import(join(dir, 'fixed.mjs'));
-	const id = await loadPHPRuntime(loader, {
-		ENV: { USE_ZEND_ALLOC: '0' },
-		pagefeatherOpen: (path) => (path.startsWith('/wordpress/') ? remote.open(path.slice(1)) : null),
-		instantiateWasm(imports, done) { const inst = new WebAssembly.Instance(wasm, imports); done(inst, wasm); return inst.exports; },
-	});
-	const php = new PHP(id);
+	const hooks = createSiteHooks(remote);
+	const php = await bootPHP(file, { pagefeatherOpen: hooks.open, pagefeatherRead: hooks.read });
 	const FS = php[__private__dont__use].FS;
-	const attach = attacher(arena);
+	const attach = attacher(arena, { noPin });
 	for (const d of INDEX.dirs) php.mkdir('/' + d);
 	for (const [name, [, size]] of Object.entries(INDEX.files)) {
 		const full = '/' + name;
@@ -110,78 +122,112 @@ async function site({ fail = () => false, pin = true, arena = null } = {}) {
 			const b = remote.data(name, out);
 			if (!b) throw new FS.ErrnoError(29);
 			return b;
-		}, { src: 'site', path: full, pin });
+		}, { src: 'site', path: full, pin: hooks.pinMode(name) });
+	}
+	if (opcache) {
+		await setPhpIniEntries(php, INI);
+		for (const [p, b] of Object.entries(opcache)) { php.mkdir(p.slice(0, p.lastIndexOf('/'))); FS.writeFile(p, b); }
 	}
 	const run = async (code) => {
-		try {
-			const r = await php.run({ code });
-			return r.text;
-		} catch (e) {
-			return 'threw: ' + String(e.message).slice(0, 300);
-		} finally {
-			remote.endRequest();
-		}
+		try { return (await php.run({ code })).text; }
+		catch (e) { return 'threw: ' + String(e.message).slice(0, 300); }
+		finally { remote.endRequest(); }
 	};
-	return { run, stats, fetched };
+	return { run, stats, fetched, php, FS };
 }
 
-test('require, include and file_get_contents of remote site files work, and the hot file too', async () => {
+test('the hybrid: a .php is fetched at its read, a data file at its open; both work, and the hot file', async () => {
 	const s = await site();
-	assert.equal(await s.run('<?php echo require "/wordpress/a.php", include "/wordpress/b.php", file_get_contents("/wordpress/d.json"), file_get_contents("/wordpress/theme.json");'), 'AB{"d":4}{"hot":1}');
+	assert.equal(await s.run('<?php echo require "/wordpress/a.php", include "/wordpress/b.php", file_get_contents("/wordpress/c.json"), file_get_contents("/wordpress/theme.json");'), 'AB{"c":3}{"hot":1}');
 	assert.equal(s.stats.rsFail, 0);
 });
 
-test('one failed pack fetch is retried once: the page is whole, rsRetry 1', async () => {
-	const s = await site({ fail: (name, nth) => name === 'st-1.zip' && nth === 1 });
-	assert.equal(await s.run('<?php echo require "/wordpress/b.php";'), 'B');
-	assert.equal(s.stats.rsRetry, 1);
-	assert.equal(s.stats.rsFail, 0);
-});
-
-test('two failures: include returns false, require is a fatal, never the text after it', async () => {
-	const s = await site({ fail: (name) => name === 'st-2.zip' });
-	assert.equal(await s.run('<?php echo (@include "/wordpress/c.php") === false ? "clean" : "WRONG";'), 'clean');
-	const out = await s.run('<?php echo "before|"; require "/wordpress/c.php"; echo "AFTER";');
-	assert.match(out, /exit code 255/);
-	assert.match(out, /before\|/);
-	assert.doesNotMatch(out, /AFTER/);
-	assert.equal(s.stats.rsRetry, 2, 'one retry per request');
-	assert.equal(s.stats.rsFail, 2);
-});
-
-test('a stat storm makes 0 fetches: file_exists, is_file, is_readable, filesize, scandir', async () => {
+test('open a .php with no read: 0 fetches (fopen, fstat, fclose, file_exists, is_file, filesize, scandir)', async () => {
 	const s = await site();
-	const out = await s.run(`<?php $n = 0; for ($i = 0; $i < 2500; $i++) { foreach (array("a.php", "b.php", "c.php", "d.json") as $f) {
-		$p = "/wordpress/" . $f; $n += file_exists($p) + is_file($p) + is_readable($p) + (filesize($p) > 0); } }
-		echo $n, "|", count(scandir("/wordpress")), "|", is_dir("/wordpress/empty") ? "dir" : "no";`);
-	assert.equal(out, '40000|9|dir');
+	const out = await s.run(`<?php $f = fopen("/wordpress/e.php", "rb"); $st = fstat($f); fclose($f);
+		$n = 0; for ($i = 0; $i < 2500; $i++) { foreach (array("a.php", "b.php", "c.json", "t.php") as $x) { $p = "/wordpress/" . $x;
+		$n += file_exists($p) + is_file($p) + is_readable($p) + (filesize($p) > 0); } }
+		echo $st["size"], "|", $n, "|", count(scandir("/wordpress"));`);
+	assert.match(out, /^17\|40000\|\d+$/);
 	assert.deepEqual(s.fetched, [], 'no pack was fetched');
 });
 
-const HALF_OPEN = `<?php $f = fopen("/wordpress/big.txt", "rb"); $head = fread($f, 10);
-	$x = require "/wordpress/b.php"; $y = require "/wordpress/c.php"; $z = file_get_contents("/wordpress/d.json");
-	$rest = stream_get_contents($f); fclose($f);
+test('the OPcache source-resolve path: the compiled form from the cache, the remote source fetched 0 times', async () => {
+	const a = await bootPHP('fixed.mjs', {});
+	await setPhpIniEntries(a, INI);
+	a.mkdir('/wordpress');
+	a.writeFile('/wordpress/t.php', '<?php return "OLD";');
+	assert.equal((await a.run({ code: '<?php echo require "/wordpress/t.php";' })).text, 'OLD');
+	const AF = a[__private__dont__use].FS;
+	const cache = {};
+	(function walk(d) { for (const n of AF.readdir(d)) { if (n === '.' || n === '..') continue; const p = d + '/' + n; if (AF.isDir(AF.stat(p).mode)) walk(p); else cache[p] = AF.readFile(p); } })(OC);
+	const s = await site({ opcache: cache });
+	assert.equal(await s.run('<?php echo require "/wordpress/t.php";'), 'OLD');
+	assert.equal(s.fetched.filter((n) => n === 'st-3.zip').length, 0, 'the source pack was never fetched');
+});
+
+test('one failed fetch is retried once, for a .php (read) and a data file (open): whole, rsRetry 2', async () => {
+	const s = await site({ fail: (name, nth) => (name === 'st-1.zip' || name === 'st-2.zip') && nth === 1 });
+	assert.equal(await s.run('<?php echo require "/wordpress/b.php", file_get_contents("/wordpress/c.json");'), 'B{"c":3}');
+	assert.equal(s.stats.rsRetry, 2);
+	assert.equal(s.stats.rsFail, 0);
+});
+
+test('a failed .php: include false, require fatal, nothing after; a failed DATA file: file_get_contents is FALSE, never ""', async () => {
+	const s = await site({ fail: (name) => name === 'st-5.zip' });
+	assert.equal(await s.run('<?php echo (@include "/wordpress/f.php") === false ? "inc-false" : "WRONG";'), 'inc-false');
+	const req = await s.run('<?php echo "before|"; require "/wordpress/f.php"; echo "AFTER";');
+	assert.match(req, /exit code 255/);
+	assert.doesNotMatch(req, /AFTER/);
+	assert.equal(await s.run('<?php $c = @file_get_contents("/wordpress/f.json"); echo $c === false ? "fgc-false" : "fgc-WRONG:" . strlen($c);'), 'fgc-false');
+});
+
+const HALF = (f) => `<?php $h = fopen("${f}", "rb"); $head = fread($h, 10);
+	$x = require "/wordpress/b.php"; $y = file_get_contents("/wordpress/c.json"); $z = require "/wordpress/e.php";
+	$rest = ""; while (!feof($h)) { $rest .= fread($h, 4096); } fclose($h);
 	echo strlen($head . $rest), "|", md5($head . $rest), "|", $x, $y, $z;`;
-const WANT = BIG.length + '|' + createHash('md5').update(BIG).digest('hex') + '|BC{"d":4}';
+const want = (b) => b.length + '|' + createHash('md5').update(b).digest('hex') + '|B{"c":3}E';
 
-test('the PIN: an open file read half, then three other packs, then the rest: every byte, exactly', async () => {
+for (const [label, path, bytes] of [['a .php (pinned at its first READ)', '/wordpress/big.php', groups[0]['wordpress/big.php']], ['a data file (pinned at its OPEN)', '/wordpress/big.json', BIGJ]]) {
+	test(`the PIN, ${label}: read half, three other packs, then the rest: every byte`, async () => {
+		const s = await site();
+		assert.equal(await s.run(HALF(path)), want(bytes));
+	});
+	test(`the PIN with the inflate arena on, ${label}: the same`, async () => {
+		const s = await site({ arena: createArena(64 * 1024) });
+		assert.equal(await s.run(HALF(path)), want(bytes));
+	});
+	test(`the guard can fail, ${label}: with the pin count removed, a read in the middle fails with EIO and the file is short`, async () => {
+		const s = await site({ noPin: true });
+		const out = await s.run(HALF(path));
+		assert.match(out, /Read of \d+ bytes failed with errno=29/);
+		const got = Number(out.replace(/<[^>]*>/g, '').trim().split('\n').pop().split('|')[0]);
+		assert.ok(Number.isFinite(got) && got > 0 && got < bytes.length, 'a short read: ' + got);
+	});
+}
+
+test('the red control: no read path Suspending, the same hooks: a .php is NOT served (it read empty: Gate 0b)', async () => {
+	const s = await site({ file: 'noread.mjs' });
+	assert.notEqual(await s.run('<?php echo require "/wordpress/a.php";'), 'A');
+});
+
+test('our JS never takes a failed .php read for empty: a JS-side read of an unfetched remote .php THROWS', async () => {
 	const s = await site();
-	assert.equal(await s.run(HALF_OPEN), WANT);
+	assert.throws(() => s.FS.readFile('/wordpress/a.php'), (e) => e.name === 'ErrnoError' && e.errno === 29);
 });
 
-test('the PIN with the inflate arena on: the same, exactly', async () => {
-	const s = await site({ arena: createArena(64 * 1024) });
-	assert.equal(await s.run(HALF_OPEN), WANT);
+// The BOOT SELF-CHECK (the lead's ask after Gate 0b's silent control): a known remote .php is read
+// through PHP at boot and compared with its recorded size and SHA-256. Empty or different: the boot
+// fails LOUDLY, never a site whose files read as empty.
+import { selfCheckCode, checkSelfCheck } from '../remote-packs.mjs';
+const SC = ['wordpress/a.php', groups[0]['wordpress/a.php'].length, sha(groups[0]['wordpress/a.php'])];
+test('the boot self-check passes on the real read path', async () => {
+	const s = await site();
+	const out = await s.run(selfCheckCode(SC));
+	assert.doesNotThrow(() => checkSelfCheck(out, SC));
 });
-
-test('the guard can fail: with the pin OFF the same read does NOT give the whole file', async () => {
-	const s = await site({ pin: false });
-	const out = await s.run(HALF_OPEN);
-	assert.notEqual(out, WANT);
-	// The failure is the one the pin prevents: a read in the MIDDLE of an open file fails with EIO
-	// (measured: "stream_get_contents(): Read of 8192 bytes failed with errno=29 I/O error"), and PHP
-	// goes on with a SHORT file. Not some other error.
-	assert.match(out, /Read of \d+ bytes failed with errno=29/);
-	const got = Number(out.replace(/<[^>]*>/g, '').trim().split('\n').pop().split('|')[0]);
-	assert.ok(Number.isFinite(got) && got > 0 && got < BIG.length, 'a short read: ' + got);
+test('the boot self-check FAILS LOUDLY when reads come back empty (the red control loader)', async () => {
+	const s = await site({ file: 'noread.mjs' });
+	const out = await s.run(selfCheckCode(SC));
+	assert.throws(() => checkSelfCheck(out, SC), /self-check/);
 });

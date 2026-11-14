@@ -42,17 +42,17 @@ perf_sum() {
   done
   python3 - "$f" <<'PY'
 import json, sys
-s = {'rfN': 0, 'rfFail': 0, 'rfCapped': 0, 'rsN': 0, 'rsFail': 0, 'rsRetry': 0, 'rsCapped': 0}; remote = None; n = 0; held = 0
+s = {'rfN': 0, 'rfFail': 0, 'rfCapped': 0, 'rsN': 0, 'rsFail': 0, 'rsRetry': 0, 'rsCapped': 0}; remote = None; n = 0; held = 0; site = None
 for line in open(sys.argv[1]):
     d = json.loads(line.split(': ', 1)[1]); n += 1
     for k in s: s[k] += int(d.get(k, 0))
-    if d.get('boot') == 1: remote = d.get('remote')
+    if d.get('boot') == 1: remote = d.get('remote'); site = d.get('siteRemote')
     held = max(held, int(d.get('rfHeldKiB', 0)))
     # Per page, for the fetch budget (#563): did it boot, how many packs, the held high-water.
     print('page %d: boot=%s rt=%s rtServed=%s rfN=%s rfPacks=%s rfHeldKiB=%s rsN=%s rsPacks=%s rsRetry=%s rsFail=%s rsHeldKiB=%s' % (n, d.get('boot'), d.get('rt'), d.get('rtServed'), d.get('rfN'), d.get('rfPacks'), d.get('rfHeldKiB'), d.get('rsN'), d.get('rsPacks'), d.get('rsRetry'), d.get('rsFail'), d.get('rsHeldKiB')), file=sys.stderr)
 # The remote state has spaces ("packs 21 files 2128 cap 64 holdKiB 2048"): one token, so the
 # key=value line splits cleanly (a run of the first shape failed here on a correct reading).
-print('pages=%d rfN=%d rfFail=%d rfCapped=%d heldKiB=%d rsN=%d rsFail=%d rsRetry=%d rsCapped=%d remote=%s' % (n, s['rfN'], s['rfFail'], s['rfCapped'], held, s['rsN'], s['rsFail'], s['rsRetry'], s['rsCapped'], str(remote).replace(' ', '_')))
+print('pages=%d rfN=%d rfFail=%d rfCapped=%d heldKiB=%d rsN=%d rsFail=%d rsRetry=%d rsCapped=%d remote=%s site=%s' % (n, s['rfN'], s['rfFail'], s['rfCapped'], held, s['rsN'], s['rsFail'], s['rsRetry'], s['rsCapped'], str(remote).replace(' ', '_'), str(site).replace(' ', '_')))
 PY
   rm -f "$f"
 }
@@ -71,7 +71,8 @@ run_case() { # run_case <label> <DEV_VARS> <python test on the perf_sum line>
   ok "$label: $line" "$(python3 -c "
 import sys; d = dict(kv.split('=', 1) for kv in sys.argv[1].split())
 n = lambda k: int(d[k])
-site_ok = (n('rsN') > 0 and n('rsFail') == 0 and n('rsCapped') == 0) if sys.argv[2] == '1' else n('rsN') == 0
+# #569: on a SITE_REMOTE build the boot self-check must have passed (siteRemote ends with selfcheck ok).
+site_ok = (n('rsN') > 0 and n('rsFail') == 0 and n('rsCapped') == 0 and d['site'].endswith('selfcheck_ok')) if sys.argv[2] == '1' else n('rsN') == 0
 print(1 if ($want) and site_ok else 0)" "$line" "$SITE")"
   local c1 c2
   local pk=oc-0.zip; [ "$SITE" = 1 ] && pk=st-0.zip
