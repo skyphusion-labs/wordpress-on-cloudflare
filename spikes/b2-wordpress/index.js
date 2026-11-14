@@ -3573,6 +3573,21 @@ async function handle(req, env, url, spikeOk, maxBody, ctx) {
 			const start = { dbTables: { ...stats.dbTables }, ocGroups: { ...stats.ocGroups }, calls: stats.calls, ms: stats.ms, fail: stats.failures.length, log: stats.log.length, rowsRead: stats.rowsRead, rowsWritten: stats.rowsWritten, inflates: stats.inflates, inflateBytes: stats.inflateBytes, reinflates: stats.reinflates, lazyWrites: stats.lazyWrites, rfN: stats.rfN, rfBytes: stats.rfBytes, rfMs: stats.rfMs, rfFail: stats.rfFail, rfCapped: stats.rfCapped, rsN: stats.rsN, rsBytes: stats.rsBytes, rsMs: stats.rsMs, rsFail: stats.rsFail, rsCapped: stats.rsCapped, rsRetry: stats.rsRetry, ocCalls: stats.ocCalls, ocHits: stats.ocHits, httpCalls: stats.httpCalls, txnOps: stats.txnOps, undoRows: stats.undoRows };
 			const delta = () => ({ calls: stats.calls - start.calls, ms: stats.ms - start.ms, failures: stats.failures.slice(start.fail), log: stats.log.slice(start.log) });
 			const t0 = Date.now();
+			// #352 the forced-reset proof (a MEASUREMENT that KILLS the isolate; spike token and HEADROOM_PROBE=on,
+			// the /_headroom kill probe's gate). plain: option A, then grow the PHP heap until the isolate resets,
+			// then option B: with REQUEST_FRAMES=on both must be gone after recovery. point: the same with a DDL
+			// (a commit point) after A: A must be KEPT. check: read A and B back (a later request, after recovery).
+			if (url.pathname === '/_frame-probe' && spikeOk && env.HEADROOM_PROBE === 'on') {
+				const mode = url.searchParams.get('mode') || 'plain';
+				const tag = String(url.searchParams.get('tag') || 'p').replace(/[^a-z0-9]/gi, '').slice(0, 16) || 'p';
+				if (mode === 'check') {
+					const r = await php.run({ code: `<?php require '/wordpress/wp-load.php'; echo json_encode(array('a' => get_option('pf352_${tag}_a', null), 'b' => get_option('pf352_${tag}_b', null)));` });
+					return new Response(r.text, { headers: { 'content-type': 'application/json', 'cache-control': 'no-store' } });
+				}
+				const point = mode === 'point' ? "$wpdb->query('CREATE TABLE IF NOT EXISTS pf352_probe_ddl (a INTEGER)');" : '';
+				const r = await php.run({ code: `<?php require '/wordpress/wp-load.php'; global $wpdb; update_option('pf352_${tag}_a', 'A', false); ${point} $keep = array(); for ($i = 0; $i < 64; $i++) { $keep[] = str_repeat('x', 8 << 20); } update_option('pf352_${tag}_b', 'B', false); echo 'survived';` });
+				return new Response(String(r.text).slice(0, 200), { headers: { 'cache-control': 'no-store' } });
+			}
 			if (url.pathname === '/_install') {
 				php.writeFile('/tmp/admin-password', req.headers.get('x-admin-password') || (env.SPIKE_TOKEN ? '' : 'local-spike-password'));
 				php.writeFile('/tmp/admin-email', req.headers.get('x-admin-email') || env.ADMIN_EMAIL || 'admin@example.com');
