@@ -506,6 +506,12 @@ function remoteOpenHook(path) {
 }
 // #569: the loader's reads ask this first (prepare.sh PY6). A remote .php whose pack is not held yet
 // returns a promise: PHP waits, then reads; a rejection fails the read with EIO before any byte.
+// #569: the remote pack counters, read BEFORE a request awaits its boot, so x-perf counts the fetches
+// the boot itself made (the site self-check). The post-boot start snapshot missed them (pf570m: rsN 13
+// against rsPacks 14 on a booting request).
+function remoteCounters() {
+	return { rfN: stats.rfN, rfBytes: stats.rfBytes, rfMs: stats.rfMs, rfFail: stats.rfFail, rfCapped: stats.rfCapped, rsN: stats.rsN, rsBytes: stats.rsBytes, rsMs: stats.rsMs, rsFail: stats.rsFail, rsCapped: stats.rsCapped, rsRetry: stats.rsRetry };
+}
 function remoteReadHook(stream, kind) {
 	return siteHooks ? siteHooks.read(stream, kind) : null;
 }
@@ -3636,6 +3642,7 @@ async function handle(req, env, url, spikeOk, maxBody, ctx) {
 			const tBoot = Date.now();
 			const booted = !bootPromise;
 			if (tracing()) fileTrace.begin({ cls: routeClass(req.method, url.pathname, url.search), method: req.method, path: url.pathname, boot: booted ? 1 : 0 });
+			const remote0 = remoteCounters();
 			bootPromise ??= boot(origin);
 			const { php, handler, bootMs } = await bootPromise;
 			const bootWaitMs = Date.now() - tBoot;
@@ -3802,13 +3809,13 @@ async function handle(req, env, url, spikeOk, maxBody, ctx) {
 					// #569: site pack fetches this request (subrequests, the one retry included), KiB, ms,
 					// the failed ones (an honest 500 if PHP required the file), the retries, the opens past
 					// the hard cap, the distinct packs, and the held high-water (the hot pack not included).
-					...(SITE_REMOTE ? { rsN: stats.rsN - start.rsN, rsKiB: Math.round((stats.rsBytes - start.rsBytes) / 1024), rsMs: stats.rsMs - start.rsMs, rsFail: stats.rsFail - start.rsFail, rsRetry: stats.rsRetry - start.rsRetry, rsCapped: stats.rsCapped - start.rsCapped, rsPacks: sitePacks ? sitePacks.lastDistinct() : 0, rsHeldKiB: sitePacks ? Math.round(sitePacks.lastHeldMax() / 1024) : 0 } : {}),
+					...(SITE_REMOTE ? { rsN: stats.rsN - remote0.rsN, rsKiB: Math.round((stats.rsBytes - remote0.rsBytes) / 1024), rsMs: stats.rsMs - remote0.rsMs, rsFail: stats.rsFail - remote0.rsFail, rsRetry: stats.rsRetry - remote0.rsRetry, rsCapped: stats.rsCapped - remote0.rsCapped, rsPacks: sitePacks ? sitePacks.lastDistinct() : 0, rsHeldKiB: sitePacks ? Math.round(sitePacks.lastHeldMax() / 1024) : 0 } : {}),
 					// #563: remote OPcache pack fetches this request (each one is a subrequest), their KiB and ms,
 					// the failed ones (a clean miss: OPcache compiled from source), the opens past the cap, and
 					// the high-water of held packs (after LRU eviction; a dropped pack is garbage until V8
 					// collects it, which /_headroom measures, not this field), and the DISTINCT packs fetched:
 					// rfN minus rfPacks is the refetch count, the held budget thrashing.
-					...(OPCACHE_REMOTE ? { rfN: stats.rfN - start.rfN, rfKiB: Math.round((stats.rfBytes - start.rfBytes) / 1024), rfMs: stats.rfMs - start.rfMs, rfFail: stats.rfFail - start.rfFail, rfCapped: stats.rfCapped - start.rfCapped, rfHeldKiB: remotePacks ? Math.round(remotePacks.lastHeldMax() / 1024) : 0, rfPacks: remotePacks ? remotePacks.lastDistinct() : 0 } : {}),
+					...(OPCACHE_REMOTE ? { rfN: stats.rfN - remote0.rfN, rfKiB: Math.round((stats.rfBytes - remote0.rfBytes) / 1024), rfMs: stats.rfMs - remote0.rfMs, rfFail: stats.rfFail - remote0.rfFail, rfCapped: stats.rfCapped - remote0.rfCapped, rfHeldKiB: remotePacks ? Math.round(remotePacks.lastHeldMax() / 1024) : 0, rfPacks: remotePacks ? remotePacks.lastDistinct() : 0 } : {}),
 					...(ledgerActive ? { mem: ledgerSnapshot('end') } : {}), // #394: the isolate memory ledger
 					bytes: r.bytes.length,
 					httpCalls: stats.httpCalls - start.httpCalls,
