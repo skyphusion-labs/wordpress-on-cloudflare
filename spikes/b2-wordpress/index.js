@@ -32,6 +32,7 @@ import { loadPHPRuntime, PHP, PHPRequestHandler, setPhpIniEntries, __private__do
 import { inflateSync } from 'fflate';
 import { createArena } from './inflate-arena.mjs';
 import { headroomStream } from './headroom.mjs';
+import { dropAndRelease } from './runtime-drop.mjs';
 import { Container, ContainerProxy, getContainer } from '@cloudflare/containers';
 import { DurableObject, WorkerEntrypoint } from 'cloudflare:workers';
 import siteZip from './build/site.zip';
@@ -201,6 +202,15 @@ function releaseRuntime(php) {
 		// already exited, or exit threw: nothing more to release
 	}
 }
+// #566: drop the runtime AND release it once every PHP run queued at the drop has settled (after
+// defaults to phpQueue), so it is never released mid-use. A bare `bootPromise = null` left the runtime
+// reachable through lastBootedPhp until the next boot: about 165 MiB per drop (#394). Every drop goes here.
+function dropRuntime(after) {
+	const boot = bootPromise;
+	const held = lastBootedPhp;
+	bootPromise = null;
+	return dropAndRelease({ boot, held, after: after || phpQueue, release: releaseRuntime });
+}
 // The admin memory trace of the request now running (#434, php/mem-trace.php): set by the
 // memTrace message at PHP shutdown, read once into the operator-only x-mem-trace header.
 let lastMemTrace = null;
@@ -309,7 +319,7 @@ function withPhp(fn) {
 		]);
 		clearTimeout(timer);
 		if (stale && bootPromise) runtimeDrops++;
-		if (stale) bootPromise = null; // the old runtime's state is unknown
+		if (stale) dropRuntime(Promise.all([prev, phpQueue])); // the old runtime's state is unknown; the stale run may still use it
 		return fn();
 	})();
 	phpQueue = run.catch(() => {});
@@ -2497,7 +2507,7 @@ export class PhpRuntime extends DurableObject {
 			// fresh isolate where the module globals are gone, which no single persistent local isolate
 			// reproduces. Nulling them here makes the local alarm take the same cold path, so the bind
 			// below (issue #208) is exercised by tests/cron-cold.py. Off by default; prod never sets it.
-			if (this.env.CRON_SIMULATE_COLD === '1') { sqlDb = null; sqlStorage = null; bootPromise = null; }
+			if (this.env.CRON_SIMULATE_COLD === '1') { sqlDb = null; sqlStorage = null; dropRuntime(); }
 			const cronOrigin = lastOrigin || this.env.SITE_ORIGIN || (await this.ctx.storage.get(ORIGIN_KEY));
 			// A database import in progress holds the cron off (import-hold.mjs): a cron run between two
 			// import parts boots WordPress on a half-loaded database, in the same isolate, and the next
@@ -2601,7 +2611,7 @@ export class PhpRuntime extends DurableObject {
 			// pointing at a failed boot; without this reset the next tick's `bootPromise ??=` reuses the
 			// failure and every later tick throws too, so a low-traffic store's deferred order emails
 			// never drain until a request reboots the runtime (#191). Reset so the next tick reboots fresh.
-			bootPromise = null;
+			dropRuntime();
 			cronRunSink = null; // #471: no cron leg is running any more
 			console.log(JSON.stringify({ m: 'cron', error: String((e && e.message) || e).slice(0, 200) }));
 			// Visible in /_purgestate too (#291): wrangler tail shows nothing for a dispatch script's alarm.
@@ -2728,8 +2738,8 @@ export class PhpRuntime extends DurableObject {
 			// resets the object, not the isolate: on fdprobe1112e (2026-11-12) the next request ran on
 			// the same isolate and the same runtime (x-perf rt 1, rtServed counting on), so
 			// plugin-memory.py never read a fresh runtime. Like /_activate, this is a restart on
-			// purpose and is not counted in runtimeDrops.
-			bootPromise = null;
+			// purpose and is not counted in runtimeDrops. #566: released once the PHP queue settles.
+			dropRuntime();
 			this.ctx.waitUntil(Promise.resolve().then(() => this.ctx.abort('evict for a new build (issue #35)')));
 			return Response.json({ evicting: true, build: BUILD_ID });
 		}
@@ -3238,13 +3248,13 @@ async function handle(req, env, url, spikeOk, maxBody, ctx) {
 		const origin = siteOrigin(env, url);
 		if (bootPromise && bootOrigin !== origin) {
 			runtimeDrops++;
-			bootPromise = null;
+			dropRuntime();
 		}
 		// A deploy-time spike long-op boots a FRESH runtime so it never inherits one the cron alarm
 		// just used: runCron and the install/activate share one PHP runtime, and a reused runtime
 		// returns runCron's output (or aborts) in place of the activation (#185). This runs inside
 		// the per-object PHP lock, so any cron run it isolates from has already finished.
-		if (url.pathname === '/_install' || url.pathname === '/_activate') bootPromise = null;
+		if (url.pathname === '/_install' || url.pathname === '/_activate') dropRuntime();
 		if (url.pathname === '/_last') return Response.json(globalThis.__lastRequest || {});
 		if (url.pathname === '/_peak') {
 			bootPromise ??= boot(origin);
@@ -3340,10 +3350,10 @@ async function handle(req, env, url, spikeOk, maxBody, ctx) {
 					// its queue in this request) are printed by the shutdown function above (#289).
 					$GLOBALS['skyphusion_act']['done'] = true;` });
 			} catch (e) {
-				bootPromise = null;
+				dropRuntime();
 				return new Response('activate failed: ' + String((e && e.message) || e), { status: 500 });
 			}
-			bootPromise = null; // a fresh runtime loads the plugin cleanly
+			dropRuntime(); // a fresh runtime loads the plugin cleanly
 			return new Response(JSON.stringify({ out: r.text.slice(-2000), errors: String(r.errors).slice(0, 2000), d1: stats.calls - start }), { headers: { 'content-type': 'application/json' } });
 		}
 		if (url.pathname === '/_opcache-dump') {
@@ -3484,7 +3494,7 @@ async function handle(req, env, url, spikeOk, maxBody, ctx) {
 					errors = 'PHP exited non-zero';
 				}
 				// The runtime is not usable for requests after this script exits. Boot a fresh one next time.
-				bootPromise = null;
+				dropRuntime();
 				objectCacheClear(); // the database changed outside WordPress's cache
 				const tail = out.length > 6000 ? out.slice(-6000) : out;
 				return Response.json({ bootMs, ms: Date.now() - t0, out: tail, errors: String(errors).slice(0, 4000), d1: delta() });
@@ -3547,7 +3557,7 @@ async function handle(req, env, url, spikeOk, maxBody, ctx) {
 			if (lost) {
 				if (ledgerActive) ledgerLog('write-loss', { lost });
 				console.log(JSON.stringify({ '@event': 'write-loss', m: 'write-loss', method: req.method, path: url.pathname, failed: lost, phpStatus: r.httpStatusCode, firstSql: sqlShape(d.failures[0].sql) }));
-				bootPromise = null; // the runtime saw the reset; the next request boots a new one
+				dropRuntime(); // the runtime saw the reset; the next request boots a new one
 				const wl = writeLossResponse(lost, wantsJson(url.pathname, url.search, req.headers.get('accept')));
 				return new Response(wl.body, { status: wl.status, headers: wl.headers });
 			}
@@ -3596,7 +3606,7 @@ async function handle(req, env, url, spikeOk, maxBody, ctx) {
 			let recycled = null;
 			if (crashed || (wasmBytes > RECYCLE_WASM_BYTES && env.PHP_RECYCLE !== 'off')) {
 				runtimeDrops++;
-				bootPromise = null;
+				dropRuntime(); // #566: released once this run (the response below) has settled
 				recycled = php;
 				out.set('x-runtime-recycled', crashed ? 'crashed' : 'memory');
 			}
@@ -3649,11 +3659,10 @@ async function handle(req, env, url, spikeOk, maxBody, ctx) {
 			// lastBootedPhp holding the old runtime, WASM memory and all, until the next boot had built a
 			// new one: after a post-new.php recycle (115 to 121 MiB) the next request booted with both.
 			// The response above is built first, so its bytes are not touched.
-			if (recycled) releaseRuntime(recycled);
 			return response;
 		} catch (e) {
 			if (bootPromise) runtimeDrops++;
-			bootPromise = null; // a failed runtime is not reused
+			dropRuntime(); // a failed runtime is not reused
 			// The stack names internal paths. It goes to the tail log for every caller, never to the body,
 			// so a leaked spike token cannot also leak stacks.
 			console.error(String((e && e.stack) || e));

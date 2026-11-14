@@ -39,9 +39,9 @@ ok('/_evict guards on typeof this.ctx.abort', /typeof this\.ctx\.abort !== 'func
 // #279: /_evict drops the module-level PHP runtime, BEFORE the abort (abort resets the object only).
 {
 	const h = src.indexOf("if (url.pathname === '/_evict') {");
-	const drop = src.indexOf('bootPromise = null;', h);
+	const drop = src.indexOf('dropRuntime();', h); // #566: the drop releases the runtime too
 	const abort = src.indexOf("this.ctx.abort('evict", h);
-	ok('/_evict sets bootPromise = null before it aborts the object', h >= 0 && drop > h && abort > drop);
+	ok('/_evict drops the runtime (dropRuntime) before it aborts the object', h >= 0 && drop > h && abort > drop);
 }
 console.log(`${fails} failing check(s)`);
 process.exit(fails ? 1 : 0);
