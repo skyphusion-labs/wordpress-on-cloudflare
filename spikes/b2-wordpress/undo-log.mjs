@@ -32,6 +32,15 @@ export function mayWrite(sql) {
 	if (/^\s*PRAGMA\s+[\w.]+\s*(\(\s*[^)]*\)\s*)?;?\s*$/i.test(s)) return false;
 	return true;
 }
+/** The verb and the first table of a statement, for a log or x-perf: never its values. */
+export function shapeOf(sql) {
+	const s = String(sql || '').replace(/\s+/g, ' ').trim();
+	const verb = (s.match(/^(\w+)/) || [, '?'])[1].toUpperCase();
+	const t = s.match(/\b(?:INTO|FROM|UPDATE|TABLE)\s+[`"]?([A-Za-z0-9_]+)/i);
+	const or = s.match(/^\w+\s+OR\s+(\w+)/i);
+	const onc = /\bON\s+CONFLICT\b/i.test(s) ? ' ON CONFLICT' : '';
+	return verb + (or ? ' OR ' + or[1].toUpperCase() : '') + (t ? ' ' + t[1] : '') + onc;
+}
 /** DDL: MySQL's implicit commit, a commit point of the frame. */
 export function isDdl(sql) {
 	return /^\s*(CREATE|ALTER|DROP|RENAME|TRUNCATE)\b/i.test(String(sql || ''));
@@ -67,6 +76,7 @@ export function createUndoLog({ stats, objectCacheDrop = () => {}, log = () => {
 	let deferred = [];
 	let recovered = false;
 	const counts = { opened: 0, kept: 0, points: 0, miss: 0 };
+	let openedBy = null; // the shape (verb and table, never values) of the statement that opened the last frame
 
 	function undoSetup(db) {
 		if (setupDone) return;
@@ -131,7 +141,8 @@ export function createUndoLog({ stats, objectCacheDrop = () => {}, log = () => {
 	function frameRow(db, req, state) {
 		db.exec('INSERT INTO _wp_frame (req, state, points, kinds, undone, t) VALUES (?, ?, ?, ?, 0, ?) ON CONFLICT (req) DO UPDATE SET state = excluded.state, points = excluded.points, kinds = excluded.kinds, t = excluded.t', req, state, points, kinds.join(','), Date.now());
 	}
-	function frameOpenNow(db) {
+	function frameOpenNow(db, sql) {
+		openedBy = sql ? shapeOf(sql) : 'php-begin';
 		undoSetup(db);
 		undoTriggers(db);
 		setActive(db, true);
@@ -166,6 +177,7 @@ export function createUndoLog({ stats, objectCacheDrop = () => {}, log = () => {
 		frameOpen: () => frameOpen,
 		phpTxnOpen: () => !!txnFrames,
 		counts: () => ({ ...counts }),
+		openedBy: () => openedBy,
 		touch(k) {
 			if (txnFrames) txnTouched.add(k);
 		},
@@ -173,7 +185,7 @@ export function createUndoLog({ stats, objectCacheDrop = () => {}, log = () => {
 		beforeStatement(db, sql) {
 			if (!armedReq) return;
 			if (frameOpen && isDdl(sql)) return this.commitPoint(db, 'ddl');
-			if (!frameOpen && mayWrite(sql) && !isDdl(sql)) frameOpenNow(db);
+			if (!frameOpen && mayWrite(sql) && !isDdl(sql)) frameOpenNow(db, sql);
 		},
 		/** After a statement: a write while armed with no frame open is a MISS, counted and logged. */
 		afterStatement(db, sql, rowsWritten) {

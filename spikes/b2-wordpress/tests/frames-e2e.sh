@@ -62,6 +62,8 @@ for kind in ('save', 'postnew', 'public'):
     miss = sum((f or {}).get('miss', 0) for f in fr)
     written = statistics.median(r['written']) if r['written'] else None
     print('MEASURE %s %s n=%d dbMs_med=%s dbN_med=%s written_med=%s frames_opened=%d miss=%d' % (mode, kind, len(p), med('dbMs'), med('dbN'), written, opened, miss))
+    bys = sorted(set((f or {}).get('by') for f in fr if f and f.get('by')))
+    if bys: print('OPENED-BY %s %s: %s' % (mode, kind, ' | '.join(bys)))
     if mode == 'on':
         if miss: ok = False; print('BAD %s: %d frame misses' % (kind, miss))
         if kind in ('save', 'postnew') and opened != len(p): ok = False; print('BAD %s: %d of %d opened a frame' % (kind, opened, len(p)))

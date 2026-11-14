@@ -262,3 +262,16 @@ test('after a PHP ROLLBACK inside a frame, a plain write is still logged and a r
 	isolate().u.recover(db, storage);
 	assert.deepEqual(ids(db), ['seed'], 'A and AFTER are undone: the frame logged both');
 });
+
+test('shapeOf names the verb and table of the statement that opened a frame, never its values', async () => {
+	const { shapeOf } = await import('../undo-log.mjs');
+	assert.equal(shapeOf("INSERT OR IGNORE INTO wp_options (a) VALUES ('secret')"), 'INSERT OR IGNORE wp_options');
+	assert.equal(shapeOf("UPDATE wp_options SET option_value = 'x' WHERE option_name = 'y'"), 'UPDATE wp_options');
+	assert.equal(shapeOf('DELETE FROM wp_woocommerce_sessions WHERE session_expiry < 5'), 'DELETE wp_woocommerce_sessions');
+	assert.equal(shapeOf("INSERT INTO t (a) VALUES (1) ON CONFLICT (a) DO NOTHING"), 'INSERT t ON CONFLICT');
+	const { db } = site();
+	const a = isolate();
+	a.u.arm(db, 'by1');
+	run(a.u, db, "UPDATE t SET v = 'x' WHERE v = 'none'");
+	assert.equal(a.u.openedBy(), 'UPDATE t');
+});

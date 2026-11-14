@@ -3746,7 +3746,7 @@ async function handle(req, env, url, spikeOk, maxBody, ctx) {
 					...(booted && SITE_REMOTE ? { siteRemote: siteState } : {}), // #569: the remote site packs at this boot
 					// #352: this request's frame: opened (the first write armed it), commit points, misses, and the
 					// rows its PHP transactions undid. Only with REQUEST_FRAMES=on.
-					...(env.REQUEST_FRAMES === 'on' && undoLog && frame0 ? (() => { const c = undoLog.counts(); return { frame: { opened: c.opened - frame0.opened, kept: c.kept - frame0.kept, points: c.points - frame0.points, miss: c.miss - frame0.miss } }; })() : {}),
+					...(env.REQUEST_FRAMES === 'on' && undoLog && frame0 ? (() => { const c = undoLog.counts(); return { frame: { opened: c.opened - frame0.opened, kept: c.kept - frame0.kept, points: c.points - frame0.points, miss: c.miss - frame0.miss, ...(c.opened > frame0.opened ? { by: undoLog.openedBy() } : {}) } }; })() : {}),
 					// #569: site pack fetches this request (subrequests, the one retry included), KiB, ms,
 					// the failed ones (an honest 500 if PHP required the file), the retries, the opens past
 					// the hard cap, the distinct packs, and the held high-water (the hot pack not included).
