@@ -6,7 +6,7 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { createHash } from 'node:crypto';
-import { createRemotePacks, createFetchBudget, REMOTE_HOLD_BYTES, REMOTE_FETCH_CAP, SITE_FETCH_CAP } from '../remote-packs.mjs';
+import { createRemotePacks, createFetchBudget, REMOTE_HOLD_BYTES, REMOTE_FETCH_CAP, SITE_FETCH_CAP, SITE_HOLD_BYTES } from '../remote-packs.mjs';
 
 // Three packs of 1000 bytes; file fN lives in pack N. parse() gives each pack one entry.
 const bytes = [0, 1, 2].map((n) => new Uint8Array(1000).fill(n + 1));
@@ -196,8 +196,13 @@ test('#569 the hot pack is fetched once per runtime and held across requests, ou
 	assert.equal(r.heldPacks(), 0, 'the request packs are gone; the hot pack is not counted among them');
 });
 
-test('#569 the defaults: site hard cap 96', () => {
+test('#569 the defaults: site hard cap 96, site held budget 8 MiB (the lead\'s choice on pf570m)', () => {
 	assert.equal(SITE_FETCH_CAP, 96);
+	// 2048 thrashed a compile boot (87 fetches, the checkout hit the cap: opcache-build run 43611818118).
+	// 8192 passed the cap (14 of 96), memory (a /_headroom reach of 108 MiB or more after a cap0 compile
+	// boot, against the 32 MiB line) and normal requests (544 KiB held): #570 issuecomment-6880689593
+	// and -6880882169.
+	assert.equal(SITE_HOLD_BYTES, 8192 * 1024);
 });
 
 // #569 audit (the #568 class: a promise that outlives its request). workerd may drop work that is
