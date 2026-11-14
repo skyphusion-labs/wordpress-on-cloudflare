@@ -239,3 +239,26 @@ test('a late result of an ended request does not land in the next request', asyn
 	assert.equal(r.data('f1'), null, 'not held in request 2');
 	assert.equal(r.heldPacks(), 0);
 });
+
+// The lead's nit on #572: a fetch that REJECTS after its request ended rethrows into a chain nobody
+// awaits any more, so it surfaced as an unhandled rejection (a log line per stale fetch). It must
+// stay a rejection for anyone who IS waiting, but never be unhandled.
+test('a stale fetch that rejects after its request ended is not an unhandled rejection', async () => {
+	const seen = [];
+	const onUnhandled = (e) => seen.push(String(e && e.message));
+	process.on('unhandledRejection', onUnhandled);
+	try {
+		let fail;
+		const late = new Promise((_, no) => { fail = no; });
+		const stats = {};
+		const r = createRemotePacks({ index, parse, stats, holdBytes: 2000, fetchPack: async () => late });
+		r.open('f2'); // nobody keeps or awaits this one: the request is about to end
+		r.endRequest();
+		fail(new Error('oc-2.zip answered 503'));
+		for (let i = 0; i < 5; i++) await new Promise((ok) => setImmediate(ok));
+		assert.deepEqual(seen, [], 'no unhandled rejection');
+		assert.equal(stats.rfFail, 0, 'a stale failure is not counted');
+	} finally {
+		process.off('unhandledRejection', onUnhandled);
+	}
+});
