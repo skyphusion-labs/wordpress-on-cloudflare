@@ -42,6 +42,14 @@ sed '/^run_worker_first/d' "$T/site.toml" > "$T/nofirst.toml"
 ok "a SITE_REMOTE build whose config lacks run_worker_first /_pf/*: REFUSED" "$([ "$(check "$T/nofirst.toml" "$T/site")" = 2 ] && echo 1 || echo 0)"
 grep -q '^run_worker_first' "$T/site.toml"; rc=$?
 ok "  (the control: the real render HAS run_worker_first)" "$([ $rc = 0 ] && echo 1 || echo 0)"
+# The lead's ruling on #570: OPcache OFF together with SITE_REMOTE cannot fit the fetch budget (every
+# script compiles, so every source is read: the checkout passed the cap), so it is refused.
+app "$T/siteonly" "$SIDX" null
+ok "a SITE_REMOTE build WITHOUT its OPcache remote index: REFUSED" "$([ "$(check "$T/site.toml" "$T/siteonly")" = 2 ] && echo 1 || echo 0)"
+sed 's/^OPCACHE_REMOTE = "on"/OPCACHE_REMOTE = "off"/' "$T/site.toml" > "$T/ocoff.toml"
+grep -q '^OPCACHE_REMOTE = "off"' "$T/ocoff.toml"; rc=$?
+ok "  (the control: the edited config sets OPCACHE_REMOTE = \"off\")" "$([ $rc = 0 ] && echo 1 || echo 0)"
+ok "a SITE_REMOTE build whose config turns OPCACHE_REMOTE off: REFUSED" "$([ "$(check "$T/ocoff.toml" "$T/site")" = 2 ] && echo 1 || echo 0)"
 # A missing index file is a plain build (an old build/ from before #563).
 mkdir -p "$T/old/build"
 ok "a build from before #563 (no index files) with the plain render: allowed" "$([ "$(check "$T/plain.toml" "$T/old")" = 0 ] && echo 1 || echo 0)"

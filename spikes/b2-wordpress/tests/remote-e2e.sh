@@ -41,7 +41,7 @@ perf_sum() {
   curl -s "${ST[@]}" -X POST -H "x-admin-password: $PW" "$B/_install" > /dev/null
   local f; f=$(mktemp)
   for u in "/?nocache=r$RANDOM" "/?post_type=product&nocache=r$RANDOM" "/wp-login.php" "/?rest_route=/wp/v2/types&nocache=r$RANDOM"; do
-    curl -s -D - -o /dev/null "${ST[@]}" "$B$u" | grep -i '^x-perf:' >> "$f"
+    curl -s -D - -o /dev/null "${ST[@]}" -H 'x-mem-ledger: 1' "$B$u" | grep -i '^x-perf:' >> "$f"
   done
   python3 - "$f" <<'PY'
 import json, sys
@@ -52,7 +52,11 @@ for line in open(sys.argv[1]):
     if d.get('boot') == 1: remote = d.get('remote'); site = d.get('siteRemote')
     held = max(held, int(d.get('rfHeldKiB', 0)))
     # Per page, for the fetch budget (#563): did it boot, how many packs, the held high-water.
-    print('page %d: boot=%s rt=%s rtServed=%s rfN=%s rfPacks=%s rfHeldKiB=%s rsN=%s rsPacks=%s rsRetry=%s rsFail=%s rsHeldKiB=%s' % (n, d.get('boot'), d.get('rt'), d.get('rtServed'), d.get('rfN'), d.get('rfPacks'), d.get('rfHeldKiB'), d.get('rsN'), d.get('rsPacks'), d.get('rsRetry'), d.get('rsFail'), d.get('rsHeldKiB')), file=sys.stderr)
+    mem = d.get('mem') or {}
+    memfs = (mem.get('memfs') or {}).get('totalMiB') if isinstance(mem.get('memfs'), dict) else None
+    # MEMORY (#570, the lead): the wasm heap after the render (wasm1MiB), the ledger's MEMFS and inflated
+    # MiB, and the held packs. The headroom reach needs an enforced isolate limit: not on local workerd.
+    print('page %d: boot=%s rt=%s rtServed=%s rfN=%s rfPacks=%s rfHeldKiB=%s rsN=%s rsPacks=%s rsRetry=%s rsFail=%s rsHeldKiB=%s | wasm1MiB=%s ledgerWasmMiB=%s memfsMiB=%s inflatedMiB=%s' % (n, d.get('boot'), d.get('rt'), d.get('rtServed'), d.get('rfN'), d.get('rfPacks'), d.get('rfHeldKiB'), d.get('rsN'), d.get('rsPacks'), d.get('rsRetry'), d.get('rsFail'), d.get('rsHeldKiB'), d.get('wasm1MiB'), mem.get('wasmMiB'), memfs, mem.get('inflatedMiB')), file=sys.stderr)
 # The remote state has spaces ("packs 21 files 2128 cap 64 holdKiB 2048"): one token, so the
 # key=value line splits cleanly (a run of the first shape failed here on a correct reading).
 print('pages=%d rfN=%d rfFail=%d rfCapped=%d heldKiB=%d rsN=%d rsFail=%d rsRetry=%d rsCapped=%d remote=%s site=%s' % (n, s['rfN'], s['rfFail'], s['rfCapped'], held, s['rsN'], s['rsFail'], s['rsRetry'], s['rsCapped'], str(remote).replace(' ', '_'), str(site).replace(' ', '_')))
@@ -93,5 +97,17 @@ run_case cap0 "REMOTE_FETCH_CAP:0" "n('pages') == 4 and n('rfN') == 0 and n('rfC
 for h in ${REMOTE_E2E_HOLDS:-}; do
   run_case "remote-hold$h" "REMOTE_HOLD_KIB:$h" "n('pages') == 4 and n('rfN') > 0 and n('rfFail') == 0 and n('rfCapped') == 0 and 0 < n('heldKiB') <= $h + 1200 and d['remote'].startswith('packs_')"
 done
-run_case off "OPCACHE_REMOTE:off" "n('pages') == 4 and n('rfN') == 0 and n('rfCapped') == 0 and d['remote'] == 'off'"
+if [ "$SITE" = 1 ]; then
+  # The lead's ruling on #570: OPcache OFF with SITE_REMOTE is refused at runtime, loudly: a 503 that
+  # names it, never a thrash (it cannot fit the fetch budget: every script compiles from source).
+  ./run.sh --stop >/dev/null 2>&1; [ -n "$STATE" ] && rm -rf "$STATE"
+  STATE=$(mktemp -d "${TMPDIR:-/tmp}/remote-e2e.XXXXXX"); export PERSIST_TO=$STATE
+  DEV_LOCAL=1 DEV_VARS="OPCACHE_REMOTE:off" ./run.sh _ping > /dev/null 2>&1 || true
+  r=$(curl -s -D - -o /dev/null "$B/?nocache=off$RANDOM" | tr -d '\r')
+  code=$(printf '%s\n' "$r" | head -1 | awk '{print $2}')
+  why=$(printf '%s\n' "$r" | grep -i '^x-site-remote-refused:' | awk '{print $2}')
+  ok "off: OPCACHE_REMOTE=off with SITE_REMOTE is REFUSED loudly (got $code, x-site-remote-refused: ${why:-none})" "$([ "$code" = 503 ] && [ "$why" = opcache-off ] && echo 1 || echo 0)"
+else
+  run_case off "OPCACHE_REMOTE:off" "n('pages') == 4 and n('rfN') == 0 and n('rfCapped') == 0 and d['remote'] == 'off'"
+fi
 exit $bad
