@@ -9,7 +9,7 @@ For each site <s>:
   may bind only: its own bucket (r2_bucket wp-wfp-<s>-media), its own
   Durable Object class (durable_object_namespace PhpRuntime, with no
   script_name or script_name site-<s>), images, assets (named ASSETS, and
-  only on an OPCACHE_SPLIT=1 build, #412), plain_text vars, and
+  only on an OPCACHE_SPLIT=1 or OPCACHE_REMOTE=1 build, #412, #563), plain_text vars, and
   the secrets WP_SALT and SPIKE_TOKEN (secret_text), TURNSTILE_SECRET when Turnstile is
   wired (#340), and SNAPSHOT_TOKEN, the key of its scheduled snapshot (#533). It may ALSO bind the
   opinionated defaults wired through the provisioning descriptor table (#201): the

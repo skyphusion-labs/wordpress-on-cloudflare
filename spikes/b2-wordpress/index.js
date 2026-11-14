@@ -41,10 +41,11 @@ import opcacheZip from './build/opcache.zip';
 // fetched from the Assets binding when a runtime boots and dropped after that request. null when
 // the build was not split (build.sh writes the default).
 import OPCACHE_BOOT from './build/opcache-boot-index.js';
-// #563 (#394 Gate 1, OPCACHE_REMOTE=1): the WARM OPcache files in static-asset packs, fetched when PHP
-// opens one (remote-packs.mjs). null on a default build (build.sh writes it): nothing changes then.
+// #563 (#394 Gate 1, OPCACHE_REMOTE=1): ALL OPcache files in static-asset packs, fetched when PHP
+// opens one (remote-packs.mjs, opcache-remote.py). No split and no boot pack. null on a default
+// build (build.sh writes it): nothing changes then.
 import OPCACHE_REMOTE from './build/opcache-remote-index.js';
-import { createRemotePacks, REMOTE_FETCH_CAP } from './remote-packs.mjs';
+import { createRemotePacks, REMOTE_FETCH_CAP, REMOTE_HOLD_BYTES } from './remote-packs.mjs';
 // The build id baked at build time (build.sh writes build/build-id.js), so the
 // object can report which code version it runs (issue #35 slice 5).
 import BUILD_ID from './build/build-id.js';
@@ -1440,7 +1441,7 @@ async function boot(origin) {
 		else lazyFile(FS, full, e, 'opcache');
 		opcacheFiles++;
 	}
-	// #563: the WARM OPcache files of an OPCACHE_REMOTE build, as remote nodes (opcache.zip is empty then).
+	// #563: every OPcache file of an OPCACHE_REMOTE build, as remote nodes (opcache.zip is empty then).
 	remotePacks = null;
 	remoteState = OPCACHE_REMOTE ? 'none' : 'none:not-built';
 	if (OPCACHE_REMOTE && ENV.OPCACHE_REMOTE === 'off') remoteState = 'off';
@@ -1451,7 +1452,9 @@ async function boot(origin) {
 	} else if (OPCACHE_REMOTE) {
 		const capRaw = Number(ENV.REMOTE_FETCH_CAP);
 		const cap = Number.isInteger(capRaw) && capRaw >= 0 && capRaw <= 1000 ? capRaw : REMOTE_FETCH_CAP;
-		remotePacks = createRemotePacks({ index: OPCACHE_REMOTE, fetchPack: fetchRemotePack, parse: zipEntries, stats, cap, log: (o) => console.error(JSON.stringify(o)) });
+		const holdRaw = Number(ENV.REMOTE_HOLD_KIB);
+		const holdBytes = Number.isInteger(holdRaw) && holdRaw >= 0 && holdRaw <= 65536 ? holdRaw * 1024 : REMOTE_HOLD_BYTES;
+		remotePacks = createRemotePacks({ index: OPCACHE_REMOTE, fetchPack: fetchRemotePack, parse: zipEntries, stats, cap, holdBytes, log: (o) => console.error(JSON.stringify(o)) });
 		let n = 0;
 		for (const [name, [, size]] of Object.entries(OPCACHE_REMOTE.files)) {
 			const full = OPCACHE_DIR + '/' + name;
@@ -1459,7 +1462,7 @@ async function boot(origin) {
 			remoteFile(FS, full, name, size);
 			n++;
 		}
-		remoteState = `packs ${OPCACHE_REMOTE.packs.length} files ${n} cap ${cap}`;
+		remoteState = `packs ${OPCACHE_REMOTE.packs.length} files ${n} cap ${cap} holdKiB ${Math.round(holdBytes / 1024)}`;
 	}
 	const tFiles = Date.now() - t0 - tWasm;
 	memAt.afterFiles = mem();
@@ -3620,8 +3623,10 @@ async function handle(req, env, url, spikeOk, maxBody, ctx) {
 					...(booted ? { l1: l1State } : {}), // #394 L1: where this boot's OPcache boot pack came from
 					...(booted && OPCACHE_REMOTE ? { remote: remoteState } : {}), // #563: the remote OPcache packs at this boot
 					// #563: remote OPcache pack fetches this request (each one is a subrequest), their KiB and ms,
-					// the failed ones (a clean miss: OPcache compiled from source) and the opens past the cap.
-					...(OPCACHE_REMOTE ? { rfN: stats.rfN - start.rfN, rfKiB: Math.round((stats.rfBytes - start.rfBytes) / 1024), rfMs: stats.rfMs - start.rfMs, rfFail: stats.rfFail - start.rfFail, rfCapped: stats.rfCapped - start.rfCapped } : {}),
+					// the failed ones (a clean miss: OPcache compiled from source), the opens past the cap, and
+					// the high-water of held packs (after LRU eviction; a dropped pack is garbage until V8
+					// collects it, which /_headroom measures, not this field).
+					...(OPCACHE_REMOTE ? { rfN: stats.rfN - start.rfN, rfKiB: Math.round((stats.rfBytes - start.rfBytes) / 1024), rfMs: stats.rfMs - start.rfMs, rfFail: stats.rfFail - start.rfFail, rfCapped: stats.rfCapped - start.rfCapped, rfHeldKiB: remotePacks ? Math.round(remotePacks.lastHeldMax() / 1024) : 0 } : {}),
 					...(ledgerActive ? { mem: ledgerSnapshot('end') } : {}), // #394: the isolate memory ledger
 					bytes: r.bytes.length,
 					httpCalls: stats.httpCalls - start.httpCalls,

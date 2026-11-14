@@ -40,7 +40,9 @@ for line in open(sys.argv[1]):
     for k in s: s[k] += int(d.get(k, 0))
     if d.get('boot') == 1: remote = d.get('remote')
     held = max(held, int(d.get('rfHeldKiB', 0)))
-print('pages=%d rfN=%d rfFail=%d rfCapped=%d heldKiB=%d remote=%s' % (n, s['rfN'], s['rfFail'], s['rfCapped'], held, remote))
+# The remote state has spaces ("packs 21 files 2128 cap 64 holdKiB 2048"): one token, so the
+# key=value line splits cleanly (a run of the first shape failed here on a correct reading).
+print('pages=%d rfN=%d rfFail=%d rfCapped=%d heldKiB=%d remote=%s' % (n, s['rfN'], s['rfFail'], s['rfCapped'], held, str(remote).replace(' ', '_')))
 PY
   rm -f "$f"
 }
@@ -66,7 +68,7 @@ print(1 if ($want) else 0)" "$line")"
   ok "$label: /_pf/ packs are never served (stranger $c1, with the spike token $c2)" "$([ "$c1" = 404 ] && [ "$c2" = 404 ] && echo 1 || echo 0)"
 }
 # The held budget is REMOTE_HOLD_KIB (2048) plus the one pack being opened (about 1024 deflated).
-run_case remote "" "n('pages') == 4 and n('rfN') > 0 and n('rfFail') == 0 and n('rfCapped') == 0 and 0 < n('heldKiB') <= 3200 and d['remote'].startswith('packs ')"
+run_case remote "" "n('pages') == 4 and n('rfN') > 0 and n('rfFail') == 0 and n('rfCapped') == 0 and 0 < n('heldKiB') <= 3200 and d['remote'].startswith('packs_')"
 run_case cap0 "REMOTE_FETCH_CAP:0" "n('pages') == 4 and n('rfN') == 0 and n('rfCapped') > 0"
 run_case off "OPCACHE_REMOTE:off" "n('pages') == 4 and n('rfN') == 0 and n('rfCapped') == 0 and d['remote'] == 'off'"
 exit $bad

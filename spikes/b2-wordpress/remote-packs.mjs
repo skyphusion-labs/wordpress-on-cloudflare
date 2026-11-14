@@ -1,8 +1,9 @@
 // OPcache files that live in static-asset packs, fetched when PHP opens one (#563, #394 Gate 1).
 //
-// The build (opcache-split.py --remote) puts the WARM OPcache files in small zips ("packs") under
-// /_pf/<build-id>/ in the static assets, and writes an index: for each file, its pack and size; for
-// each pack, its byte length and SHA-256. Only the index is in the bundle. MEMFS gets a node per file
+// The build (opcache-remote.py) puts EVERY OPcache file in zips of about 1 MiB ("packs") under
+// /_pf/<build-id>/ in the static assets, in the order a cold boot reads them, and writes an index:
+// for each file, its pack and size; for each pack, its byte length and SHA-256. Only the index is
+// in the bundle. There is no split and no boot pack (#394 issuecomment-6878206213). MEMFS gets a node per file
 // at boot (so stat() needs no bytes), and the loader's open() asks open() here first (prepare.sh,
 // the pagefeatherOpen hook). A file whose pack is not held yet returns a promise: PHP pauses until
 // the pack is fetched and checked. Then the node's contents getter inflates from the held pack.
@@ -15,9 +16,20 @@
 // - a pack that failed is not fetched again in the same request; the next request tries again.
 // Every pack fetch is a subrequest (Gate 0, #394 issuecomment-6878010968: ASSETS.fetch counts
 // against the limit), so a request fetches at most `cap` packs. Past that, opens fail as above.
-// Packs are held for one request only (endRequest, next to evictLazy).
+// The held budget: at most holdBytes of packs are held (REMOTE_HOLD_KIB, default 2048), least
+// recently used out first; the pack being opened is always kept. A cold boot reads its files in
+// about pack order, so it STREAMS: about 2 MiB held, not the 14 MiB L1's boot pack held. A read of
+// a file whose pack was evicted fails with EIO (the contents getter has the bytes or throws), and
+// OPcache compiles that script: never a half file. Every pack is dropped at the end of a request
+// (endRequest, next to evictLazy), so nothing is held across requests.
+//
+// The cap: Workers Paid allows 10,000 subrequests per invocation (Workers limits page, Nov 13 2026).
+// A cold boot fetches about 21 packs (14 MiB boot plus 6.65 MiB warm at 1 MiB, pf394a). 64 is 3x
+// that, and fails clean (a compile) far below the platform limit. A Free site (50) or a site with a
+// lower [limits] subrequests must set REMOTE_FETCH_CAP below its own limit.
 
-export const REMOTE_FETCH_CAP = 32;
+export const REMOTE_FETCH_CAP = 64;
+export const REMOTE_HOLD_BYTES = 2048 * 1024;
 
 async function sha256hex(bytes) {
 	const h = new Uint8Array(await crypto.subtle.digest('SHA-256', bytes));
@@ -29,16 +41,40 @@ async function sha256hex(bytes) {
 // index: { id, packs: [{ name, bytes, sha256 }], files: { <name>: [packNo, size] } }
 // fetchPack(name) -> Promise<Uint8Array> (throws on a non-200); parse(bytes) -> zip entries
 // ({ name, data(out) }, index.js zipEntries); stats: the counters x-perf reads (rf*).
-export function createRemotePacks({ index, fetchPack, parse, stats, cap = REMOTE_FETCH_CAP, log = () => {} }) {
-	const held = new Map(); // packNo -> Map(name -> entry), this request only
+export function createRemotePacks({ index, fetchPack, parse, stats, cap = REMOTE_FETCH_CAP, holdBytes = REMOTE_HOLD_BYTES, log = () => {} }) {
+	// packNo -> Map(name -> entry), this request only. A Map keeps insertion order: the first key is
+	// the least recently used pack (touch() moves a pack to the end).
+	const held = new Map();
+	let heldBytes = 0;
+	let heldMax = 0;
+	let lastHeldMax = 0;
 	const pending = new Map(); // packNo -> promise of the fetch in flight
 	const failed = new Set(); // packNo that failed in this request
 	let reqN = 0;
 	let cappedLogged = false;
 	for (const k of ['rfN', 'rfBytes', 'rfMs', 'rfFail', 'rfCapped']) if (typeof stats[k] !== 'number') stats[k] = 0;
 
+	function touch(packNo) {
+		const m = held.get(packNo);
+		held.delete(packNo);
+		held.set(packNo, m);
+	}
+	function hold(packNo, m, size) {
+		held.set(packNo, m);
+		heldBytes += size;
+		// Least recently used out first, but never the pack just fetched.
+		for (const k of held.keys()) {
+			if (heldBytes <= holdBytes || k === packNo) break;
+			held.delete(k);
+			heldBytes -= index.packs[k].bytes;
+		}
+		if (heldBytes > heldMax) heldMax = heldBytes;
+	}
 	function load(packNo) {
-		if (held.has(packNo)) return null;
+		if (held.has(packNo)) {
+			touch(packNo);
+			return null;
+		}
 		if (pending.has(packNo)) return pending.get(packNo);
 		if (failed.has(packNo)) return Promise.reject(new Error('pack ' + packNo + ' failed earlier in this request'));
 		if (reqN >= cap) {
@@ -58,7 +94,7 @@ export function createRemotePacks({ index, fetchPack, parse, stats, cap = REMOTE
 			if (h !== pk.sha256) throw new Error(pk.name + ': SHA-256 mismatch');
 			const m = new Map();
 			for (const e of parse(bytes)) m.set(e.name, e);
-			held.set(packNo, m);
+			hold(packNo, m, bytes.length);
 			stats.rfBytes += bytes.length;
 		})().then(
 			() => {
@@ -94,10 +130,15 @@ export function createRemotePacks({ index, fetchPack, parse, stats, cap = REMOTE
 		},
 		endRequest() {
 			held.clear();
+			heldBytes = 0;
+			lastHeldMax = heldMax;
+			heldMax = 0;
 			failed.clear();
 			reqN = 0;
 			cappedLogged = false;
 		},
 		heldPacks: () => held.size,
+		// The high-water of held pack bytes in the request that ended last (x-perf rfHeldKiB).
+		lastHeldMax: () => lastHeldMax,
 	};
 }

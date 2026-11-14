@@ -399,21 +399,24 @@ mem_ledger_var() {
 # #394 L1 (OPCACHE_SPLIT=1): the object fetches the OPcache boot packs through an ASSETS binding,
 # and /_pf/ must reach the Worker first (which refuses it), or the asset router would serve the
 # site's compiled PHP to anyone (#412). Nothing is added when the build is not split.
+# #563: an OPCACHE_REMOTE=1 build needs the same binding and /_pf/ first: its packs hold ALL of the
+# site's compiled PHP. opcache_remote_var refuses the two flags together.
 opcache_split_assets() {
   case "${OPCACHE_SPLIT:-0}" in
-    0) ;;
+    0) [ "${OPCACHE_REMOTE:-0}" = 1 ] && printf '\nbinding = "ASSETS"\nrun_worker_first = ["/_pf/*"]'; true ;;
     1) printf '\nbinding = "ASSETS"\nrun_worker_first = ["/_pf/*"]' ;;
     *) echo "OPCACHE_SPLIT must be 0 or 1, not ${OPCACHE_SPLIT}" >&2; return 1 ;;
   esac
 }
-# #563 (#394 Gate 1, OPCACHE_REMOTE=1): the WARM OPcache files leave the bundle too, as packs under /_pf/
-# that PHP fetches while it pauses in open(). It needs the split (the trace, the ASSETS binding and
-# /_pf/ first), so it fails without OPCACHE_SPLIT=1. The var is rendered so that the config hash
-# changes with the flag: the build id does not, and an update would otherwise upload nothing.
+# #563 (#394 Gate 1, OPCACHE_REMOTE=1): ALL OPcache files leave the bundle, as packs under /_pf/ that
+# PHP fetches while it pauses in open() (opcache-remote.py, remote-packs.mjs). NO split: the
+# 2026-11-13 ruling keeps OPCACHE_SPLIT off (#394 issuecomment-6862048364), so the two flags
+# together fail. The var is rendered so that the config hash changes with the flag: the build id
+# does not, and an update would otherwise upload nothing.
 opcache_remote_var() {
   case "${OPCACHE_REMOTE:-0}" in
     0) ;;
-    1) [ "${OPCACHE_SPLIT:-0}" = 1 ] || { echo "OPCACHE_REMOTE=1 needs OPCACHE_SPLIT=1" >&2; return 1; }
+    1) [ "${OPCACHE_SPLIT:-0}" = 1 ] && { echo "OPCACHE_REMOTE=1 and OPCACHE_SPLIT=1 together: pick one (#563 has no split)" >&2; return 1; }
        echo 'OPCACHE_REMOTE = "on"' ;;
     *) echo "OPCACHE_REMOTE must be 0 or 1, not ${OPCACHE_REMOTE}" >&2; return 1 ;;
   esac
@@ -717,11 +720,16 @@ build_dosql() {
     tail -1 build/opcache.log
     # #394 L1 (OPCACHE_SPLIT=1): trace which OPcache files a WARM request reads on the primed build,
     # then keep only those as the module; the rest become static assets fetched when a runtime boots.
-    if [ "${OPCACHE_SPLIT:-0}" = 1 ]; then
+    # #563 (OPCACHE_REMOTE=1): the same trace, then EVERY OPcache file to packs in cold-boot read order.
+    opcache_remote_var > /dev/null || exit 1
+    if [ "${OPCACHE_SPLIT:-0}" = 1 ] || [ "${OPCACHE_REMOTE:-0}" = 1 ]; then
       WOO_ACTIVE=$woo DEV_ENV=dosql-local ./file-trace.sh > build/file-trace.log 2>&1 || { echo "file-trace.sh failed:"; tail -15 build/file-trace.log; exit 1; }
-      # #563: OPCACHE_REMOTE=1 moves the warm files to packs as well (opcache.zip is left empty).
-      opcache_remote_var > /dev/null || exit 1
-      python3 -I opcache-split.py build/opcache.zip build/file-trace.json build/build-id.js $([ "${OPCACHE_REMOTE:-0}" = 1 ] && echo --remote) || exit 1
+    fi
+    if [ "${OPCACHE_SPLIT:-0}" = 1 ]; then
+      python3 -I opcache-split.py build/opcache.zip build/file-trace.json build/build-id.js || exit 1
+    fi
+    if [ "${OPCACHE_REMOTE:-0}" = 1 ]; then
+      python3 -I opcache-remote.py build/opcache.zip build/file-trace.json build/build-id.js || exit 1
     fi ) || return 1
   # The subshell status is checked (#313): under "site update --all" (if "$fn") set -e is off, and
   # a failed opcache.sh used to fall through to the size check with the EMPTY opcache.zip that
