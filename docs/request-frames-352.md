@@ -101,3 +101,21 @@ off: 10 REST post saves, 10 `post-new.php` GETs and 10 public GETs, `x-perf` `db
 - Cron ticks are not framed: Action Scheduler hands each email off inside its action (#362), so each
   action is a commit point. That is phase 2.
 - Approach A (`deploy/deploy.sh`, MySQL) is not covered.
+
+## Field finding: frames were never armed in a deployed object (pf352f, 2026-11-14)
+
+The first forced-reset proof on pf352f (5240903) kept option A after a real isolate memory reset. The
+Workers Logs showed the reset, a `frame-probe` with no state, and no recovery line. The cause was in
+`index.js`: the one undo log per isolate was created at its first use with `frames` fixed from `ENV`. In a
+deployed object that first use is the `PhpRuntime` constructor's recovery, before any fetch has set `ENV`,
+so `frames` was false for the whole isolate and no frame was ever armed. Local workerd hid it: there the
+Worker's fetch shares the isolate and sets `ENV` first, so CI saw frames open.
+
+The fix: `frames` is a function asked at each `arm()`, and the constructor sets `ENV` before recovery.
+The logs that would have shown it at once are now always written:
+
+- `frame-recover` at every recovery, also when nothing was open (`active`, `tables`, `frames`, `undone`, `req`);
+- `frame-open` when a frame open is committed (`req`, `by`, `tx`), never for a no-op that took the open back;
+- `frame-probe-raw` on the Worker: the `/_frame` answer's status, body keys, frame and reason.
+
+`/_frame?id=` answers a spike-token holder with the frame, and the write-loss answer carries `x-pf-req`.

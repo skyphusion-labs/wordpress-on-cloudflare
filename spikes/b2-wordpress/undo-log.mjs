@@ -71,7 +71,10 @@ function schemaSig(db) {
 	return r.n + ':' + r.l;
 }
 
+// frames: a boolean, or a function asked each time it matters (index.js: the undo log may be made by the
+// PhpRuntime constructor's recovery before any fetch has set ENV, so a value fixed at creation was wrong).
 export function createUndoLog({ stats, objectCacheDrop = () => {}, log = () => {}, frames = false } = {}) {
+	const framesOn = () => !!(typeof frames === 'function' ? frames() : frames);
 	let undoSchemaSig = null;
 	let setupDone = false;
 	let txnFrames = null; // PHP's transaction and its savepoints: [{ name, seq }]
@@ -90,7 +93,7 @@ export function createUndoLog({ stats, objectCacheDrop = () => {}, log = () => {
 		db.exec('CREATE TABLE IF NOT EXISTS _wp_undo (seq INTEGER PRIMARY KEY AUTOINCREMENT, sql TEXT NOT NULL)');
 		db.exec('CREATE TABLE IF NOT EXISTS _wp_undo_state (id INTEGER PRIMARY KEY CHECK (id = 1), active INTEGER NOT NULL)');
 		db.exec('INSERT OR IGNORE INTO _wp_undo_state (id, active) VALUES (1, 0)');
-		if (frames) db.exec('CREATE TABLE IF NOT EXISTS _wp_frame (req TEXT PRIMARY KEY, state TEXT NOT NULL, points INTEGER NOT NULL, kinds TEXT NOT NULL, undone INTEGER NOT NULL, t INTEGER NOT NULL)');
+		if (framesOn()) db.exec('CREATE TABLE IF NOT EXISTS _wp_frame (req TEXT PRIMARY KEY, state TEXT NOT NULL, points INTEGER NOT NULL, kinds TEXT NOT NULL, undone INTEGER NOT NULL, t INTEGER NOT NULL)');
 		setupDone = true;
 	}
 	function undoTriggers(db) {
@@ -175,7 +178,7 @@ export function createUndoLog({ stats, objectCacheDrop = () => {}, log = () => {
 	return {
 		/** Arm a frame for this request (frames on). It opens at the first write. */
 		arm(db, req) {
-			if (!frames) return;
+			if (!framesOn()) return;
 			armedReq = String(req || 'req-' + Date.now());
 			points = 0;
 			kinds = [];
@@ -204,7 +207,9 @@ export function createUndoLog({ stats, objectCacheDrop = () => {}, log = () => {
 		statement(db, storage, sql, fn) {
 			const opens = armedReq && !frameOpen && mayWrite(sql) && !isDdl(sql) && storage && typeof storage.transactionSync === 'function';
 			if (!opens) {
+				const was = frameOpen;
 				this.beforeStatement(db, sql);
+				if (!was && frameOpen) log({ m: 'frame-open', req: armedReq, by: openedBy, tx: false });
 				return fn();
 			}
 			const NOOP = {};
@@ -227,7 +232,9 @@ export function createUndoLog({ stats, objectCacheDrop = () => {}, log = () => {
 				setupDone = false;
 				if (e !== NOOP) throw e;
 				counts.noop++;
+				return result;
 			}
+			log({ m: 'frame-open', req: armedReq, by: openedBy, tx: true });
 			return result;
 		},
 		/** After a statement: a write while armed with no frame open is a MISS, counted and logged. */
@@ -274,7 +281,10 @@ export function createUndoLog({ stats, objectCacheDrop = () => {}, log = () => {
 				const kind = op.op;
 				if (kind === 'begin') {
 					if (txnFrames && !frameOpen) phpClose(db); // MySQL commits an open transaction first
-					if (armedReq && !frameOpen) frameOpenNow(db);
+					if (armedReq && !frameOpen) {
+						frameOpenNow(db);
+						log({ m: 'frame-open', req: armedReq, by: openedBy, tx: false });
+					}
 					undoSetup(db);
 					undoTriggers(db);
 					txnFrames = [{ name: null, seq: undoSeq(db) }];
@@ -325,9 +335,13 @@ export function createUndoLog({ stats, objectCacheDrop = () => {}, log = () => {
 			try {
 				active = db.exec('SELECT active FROM _wp_undo_state WHERE id = 1').one().active;
 			} catch {
+				log({ m: 'frame-recover', active: 0, tables: false, frames: framesOn() });
 				return null; // no undo tables yet: no transaction or frame was ever opened
 			}
-			if (!active) return null;
+			if (!active) {
+				log({ m: 'frame-recover', active: 0, tables: true, frames: framesOn() });
+				return null;
+			}
 			const n = undoTo(db, storage, 0);
 			db.exec('DELETE FROM _wp_undo');
 			txnFrames = null;
@@ -342,6 +356,7 @@ export function createUndoLog({ stats, objectCacheDrop = () => {}, log = () => {
 				// frames were never on here
 			}
 			log({ m: 'txn', recovered: true, undone: n, req });
+			log({ m: 'frame-recover', active: 1, tables: true, frames: framesOn(), undone: n, req });
 			return { undone: n, req };
 		},
 		/** The outcome of a request, for the Worker's /_frame probe: null when unknown. */

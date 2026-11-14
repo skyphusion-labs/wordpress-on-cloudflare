@@ -2246,7 +2246,9 @@ async function httpOp(op) {
 // constructor, before anything reads the database.
 let undoLog = null;
 function undo(env = ENV) {
-	if (!undoLog) undoLog = createUndoLog({ stats, objectCacheDrop, log: (o) => console.log(JSON.stringify(o)), frames: !!(env && env.REQUEST_FRAMES === 'on') });
+	// frames is asked at each arm, from the env of the call or ENV: the first undo() of a deployed object is
+	// the constructor's recovery, before any fetch has set ENV (pf352f, 2026-11-14: no frame ever armed).
+	if (!undoLog) undoLog = createUndoLog({ stats, objectCacheDrop, log: (o) => console.log(JSON.stringify(o)), frames: () => !!((env || ENV) && (env || ENV).REQUEST_FRAMES === 'on') });
 	return undoLog;
 }
 function txnOp(db, storage, op) {
@@ -2505,6 +2507,7 @@ export class PhpRuntime extends DurableObject {
 	// alarm, /_dbexport or snapshot reads the database (blockConcurrencyWhile holds them all).
 	constructor(ctx, env) {
 		super(ctx, env);
+		ENV = env;
 		if (env.DB_IN_DO === 'on' && env.REAL_TRANSACTIONS !== 'off') ctx.blockConcurrencyWhile(async () => { txnRecover(ctx.storage.sql, ctx.storage); });
 	}
 	// Page cache purges for the whole site (issue #78). PHP runs in this one
@@ -3072,16 +3075,24 @@ async function frameProbe(env, name, id) {
 	try {
 		const stub = env.PHP_RUNTIME.get(env.PHP_RUNTIME.idFromName(name), env.PHP_LOCATION ? { locationHint: env.PHP_LOCATION } : undefined);
 		const r = await stub.fetch(new Request('https://php-object/_frame?id=' + encodeURIComponent(id)));
+		const text = await r.text();
+		let j = null;
+		try { j = JSON.parse(text); } catch {}
+		// The raw answer, so a null state is never a blind spot: status, the body keys, the frame or the reason.
+		console.log(JSON.stringify({ m: 'frame-probe-raw', status: r.status, keys: j && typeof j === 'object' ? Object.keys(j) : null, frame: j ? j.frame ?? null : null, reason: j ? j.reason ?? null : null, body: j ? undefined : text.slice(0, 120) }));
 		if (!r.ok) return null;
-		const j = await r.json();
 		return (j && j.frame) || null;
-	} catch {
+	} catch (e) {
+		console.log(JSON.stringify({ m: 'frame-probe-raw', error: String((e && e.message) || e).slice(0, 200) }));
 		return null;
 	}
 }
 async function toPhpObject(req, env, url, ctx) {
 	const name = phpObjectName(env, url);
-	// #352: /_frame is the Worker's own probe of the object, never a client's.
+	// #352: /_frame is the Worker's own probe of the object. A client gets 404; a spike-token holder gets the
+	// frame of ?id= (the proof reads it; the request id is in the x-pf-req response header).
+	const frameSpikeOk = Boolean(env.SPIKE_TOKEN) && req.headers.get('x-spike-token') === env.SPIKE_TOKEN;
+	if (url.pathname === '/_frame' && frameSpikeOk) return Response.json({ frame: await frameProbe(env, name, url.searchParams.get('id') || '') }, { headers: { 'cache-control': 'no-store' } });
 	if (url.pathname === '/_frame') return new Response('Not Found', { status: 404 });
 	// #352: one id per client request (a retry keeps it), so the probe can ask for this request's frame.
 	const pfReq = env.REQUEST_FRAMES === 'on' ? crypto.randomUUID() : null;
@@ -3134,6 +3145,7 @@ async function toPhpObject(req, env, url, ctx) {
 			console.log(JSON.stringify({ m: 'frame-probe', phase: 'request-killed', state: fr ? fr.state : null, points: fr ? fr.points : null }));
 			const wl = frameProvesRollback(fr) ? rolledBackResponse(wantsJson(url.pathname, url.search, req.headers.get('accept')), kind, fr.undone) : writeLossResponse('unknown', wantsJson(url.pathname, url.search, req.headers.get('accept')), kind);
 			wl.headers['x-php-object'] = name;
+			if (pfReq) wl.headers['x-pf-req'] = pfReq; // the request id, for a spike-token /_frame read (#352)
 			return new Response(wl.body, { status: wl.status, headers: wl.headers });
 		}
 		const headers = objectErrorHeaders(kind, name, OVERLOAD_RETRY_AFTER_S);
@@ -3152,6 +3164,7 @@ async function toPhpObject(req, env, url, ctx) {
 		if (frameProvesRollback(fr)) {
 			const rb = rolledBackResponse(wantsJson(url.pathname, url.search, req.headers.get('accept')), r.headers.get('x-isolate-reset') === 'storage' ? 'storage' : 'memory', fr.undone);
 			rb.headers['x-php-object'] = name;
+			if (pfReq) rb.headers['x-pf-req'] = pfReq;
 			return new Response(rb.body, { status: rb.status, headers: rb.headers });
 		}
 	}
