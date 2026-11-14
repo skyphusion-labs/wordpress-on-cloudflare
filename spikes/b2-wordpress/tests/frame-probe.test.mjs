@@ -35,3 +35,11 @@ test('index.js: both write-loss paths answer "rolled back" ONLY behind frameProv
 	assert.equal([...src.matchAll(/frameProvesRollback\(fr\) \? rolledBackResponse\(/g)].length + [...src.matchAll(/if \(frameProvesRollback\(fr\)\) \{\n\t\t\tconst rb = rolledBackResponse\(/g)].length, 2, 'each one gated on the proof');
 	assert.match(src, /if \(url\.pathname === '\/_frame'\) return new Response\('Not Found', \{ status: 404 \}\);/);
 });
+
+// The forced-reset proof route (#352, run on the lead's throwaway): it KILLS the isolate, so it must be
+// spike-gated AND allowed only with HEADROOM_PROBE=on (the same gate as the /_headroom kill probe).
+test('index.js: /_frame-probe is spike-gated and needs HEADROOM_PROBE=on; plain, point (a DDL) and check modes', () => {
+	assert.match(src, /if \(url\.pathname === '\/_frame-probe' && spikeOk && env\.HEADROOM_PROBE === 'on'\) \{/);
+	assert.match(src, /mode === 'point' \? "\$wpdb->query\('CREATE TABLE IF NOT EXISTS pf352_probe_ddl \(a INTEGER\)'\);" : ''/);
+	assert.match(src, /if \(mode === 'check'\)/);
+});
