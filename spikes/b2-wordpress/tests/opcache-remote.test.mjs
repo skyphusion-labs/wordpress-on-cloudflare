@@ -94,13 +94,13 @@ async function makeCache() {
 const parse = (bytes) => Object.entries(unzipSync(bytes)).map(([name, b]) => ({ name, data: () => b }));
 
 // A second runtime: source now says NEW, the cache files are remote nodes. Returns what PHP printed.
-async function runRemote({ file = 'fixed.mjs', index, fetchPack, cap, requests = 1 }) {
+async function runRemote({ file = 'fixed.mjs', index, fetchPack, cap, holdBytes, requests = 1, sources = { '/src/t.php': '<?php return "NEW";' }, code = '<?php echo require "/src/t.php";' }) {
 	const stats = {};
-	const remote = createRemotePacks({ index, fetchPack, parse, stats, cap });
+	const remote = createRemotePacks({ index, fetchPack, parse, stats, cap, holdBytes });
 	const hook = (path) => (path.startsWith(OC + '/') ? remote.open(path.slice(OC.length + 1)) : null);
 	const php = await boot(file, hook);
 	const FS = php[__private__dont__use].FS;
-	php.writeFile('/src/t.php', '<?php return "NEW";');
+	for (const [p, body] of Object.entries(sources)) php.writeFile(p, body);
 	for (const [name, [, size]] of Object.entries(index.files)) {
 		const full = OC + '/' + name;
 		php.mkdir(full.slice(0, full.lastIndexOf('/')));
@@ -120,12 +120,13 @@ async function runRemote({ file = 'fixed.mjs', index, fetchPack, cap, requests =
 	const outs = [];
 	for (let i = 0; i < requests; i++) {
 		try {
-			const r = await php.run({ code: '<?php echo require "/src/t.php";' });
+			const r = await php.run({ code });
 			outs.push(r.text);
 		} catch (e) {
 			outs.push('threw: ' + String(e.message).slice(0, 120));
 		}
 		remote.endRequest();
+		stats.heldMax = Math.max(stats.heldMax || 0, remote.lastHeldMax());
 	}
 	return { outs, stats };
 }
@@ -191,4 +192,37 @@ test('default OFF: with no pagefeatherOpen hook, open() is not wrapped at all', 
 	const on = {};
 	await boot('fixed.mjs', () => null, on);
 	assert.equal(on.openatSuspending, true);
+});
+
+// Two scripts, each in its OWN pack, the second pack evicting the first (a budget of 1 byte keeps only
+// the pack being opened). A cold boot streams: both come from the cache (OLD), two fetches, and the
+// request never held more than one pack.
+test('a cold boot streams through packs under the held budget: OLD and OLD, one pack held at a time', async () => {
+	const php = await boot('fixed.mjs');
+	php.writeFile('/src/t1.php', '<?php return "OLD1";');
+	php.writeFile('/src/t2.php', '<?php return "OLD2";');
+	assert.equal((await php.run({ code: '<?php echo require "/src/t1.php", require "/src/t2.php";' })).text, 'OLD1OLD2');
+	const FS = php[__private__dont__use].FS;
+	const all = {};
+	for (const p of walk(FS, OC)) all[p.slice(OC.length + 1)] = FS.readFile(p);
+	const groups = [{}, {}];
+	for (const [n, b] of Object.entries(all)) groups[n.endsWith('/src/t2.php.bin') ? 1 : 0][n] = b;
+	assert.ok(Object.keys(groups[1]).length === 1, 'one cache file for t2');
+	const packs = groups.map((g) => zipSync(g, { level: 6 }));
+	const idx = {
+		id: 'test2',
+		packs: packs.map((p, i) => ({ name: 'oc-' + i + '.zip', bytes: p.length, sha256: createHash('sha256').update(p).digest('hex') })),
+		files: Object.fromEntries(groups.flatMap((g, i) => Object.entries(g).map(([n, b]) => [n, [i, b.length]]))),
+	};
+	const { outs, stats } = await runRemote({
+		index: idx,
+		holdBytes: 1,
+		fetchPack: async (name) => packs[Number(name.slice(3, 4))].slice(),
+		sources: { '/src/t1.php': '<?php return "NEW1";', '/src/t2.php': '<?php return "NEW2";' },
+		code: '<?php echo require "/src/t1.php", require "/src/t2.php";',
+	});
+	assert.deepEqual(outs, ['OLD1OLD2']);
+	assert.equal(stats.rfN, 2);
+	assert.equal(stats.rfFail, 0);
+	assert.equal(stats.heldMax, Math.max(...packs.map((p) => p.length)), 'never more than one pack held');
 });
