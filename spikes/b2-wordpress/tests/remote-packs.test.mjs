@@ -104,3 +104,43 @@ test('the defaults are the measured choice: 4 MiB held (3 packs of about 1.1 MiB
 	assert.equal(REMOTE_HOLD_BYTES, 4096 * 1024);
 	assert.equal(REMOTE_FETCH_CAP, 64);
 });
+
+// #563 audit (the #568 class: a promise that outlives its request). workerd may drop work that is
+// not awaited by a live request, so a fetch in flight when a request ends must not be WAITED on by
+// the next request, and its late result must not land in the next request's held packs.
+test('a fetch still in flight at endRequest is not waited on by the next request', async () => {
+	let release;
+	const hang = new Promise(() => {}); // a fetch workerd dropped: it never settles
+	let calls = 0;
+	const stats = {};
+	const r = createRemotePacks({ index, parse, stats, holdBytes: 2000, fetchPack: async (name) => {
+		calls++;
+		if (calls === 1) return hang;
+		return bytes[Number(name.slice(3, 4))].slice();
+	} });
+	const first = r.open('f0'); // request 1 ends while this is in flight
+	assert.ok(first);
+	r.endRequest();
+	const second = r.open('f0'); // request 2 must fetch again, not wait on request 1's promise
+	assert.ok(second && second !== first, 'a NEW fetch, not the dropped one');
+	await second;
+	assert.ok(r.data('f0'));
+	assert.equal(calls, 2);
+});
+
+test('a late result of an ended request does not land in the next request', async () => {
+	let finish;
+	const late = new Promise((ok) => { finish = ok; });
+	let calls = 0;
+	const stats = {};
+	const r = createRemotePacks({ index, parse, stats, holdBytes: 2000, fetchPack: async (name) => {
+		calls++;
+		return calls === 1 ? late : bytes[Number(name.slice(3, 4))].slice();
+	} });
+	const first = r.open('f1');
+	r.endRequest();
+	finish(bytes[1].slice()); // request 1's fetch settles AFTER its request ended
+	await first.catch(() => {});
+	assert.equal(r.data('f1'), null, 'not held in request 2');
+	assert.equal(r.heldPacks(), 0);
+});
