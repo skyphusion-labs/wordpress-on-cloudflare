@@ -74,6 +74,12 @@ def main():
     if site != var_site:
         bad.append('the build %s a SITE_REMOTE build but the config %s SITE_REMOTE = "on": build and config disagree'
                    % ('IS' if site else 'is NOT', 'has' if var_site else 'lacks'))
+    # The lead's ruling on #570: OPcache OFF together with SITE_REMOTE cannot fit the fetch budget (every
+    # script compiles, so every source is read; the checkout passed the hard cap), so it is refused.
+    if site and not opc:
+        bad.append('a SITE_REMOTE build needs its OPcache remote index (OPCACHE_REMOTE=1): without OPcache every script compiles and reads its source, which cannot fit the fetch budget')
+    if site and unq((c.get('vars') or {}).get('OPCACHE_REMOTE')) == 'off':
+        bad.append('a SITE_REMOTE build with OPCACHE_REMOTE = "off": refused (OPcache off with remote sources cannot fit the fetch budget)')
     if site or opc:
         kind = 'SITE_REMOTE' if site else 'OPCACHE_REMOTE'
         if binding != 'ASSETS':

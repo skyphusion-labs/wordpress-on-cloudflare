@@ -518,6 +518,13 @@ async function fetchRemotePack(name) {
 // the held pack. A read with the pack not held fails with EIO (the open fetches it first).
 // #569: a remote SITE file. The same, but PINNED while open (attachLazyContents tag.pin): no evict
 // drops an open file's bytes, so after a successful open() every read succeeds.
+// #569: a SITE_REMOTE boot that refuses (no ASSETS binding, OPcache off, the self-check failed). The
+// request handler answers it with a 503 that NAMES the reason (x-site-remote-refused), never a bare 500.
+function siteRefusal(code, message) {
+	const e = new Error('site refused (' + code + '): ' + message);
+	e.siteRemoteRefused = code;
+	return e;
+}
 function remoteSiteFile(FS, path, name, size) {
 	FS.writeFile(path, new Uint8Array(0));
 	attachLazyContents(FS.lookupPath(path).node, size, (out) => {
@@ -1518,7 +1525,15 @@ async function boot(origin) {
 		if (!ENV.ASSETS) {
 			siteState = 'fail:no-assets-binding';
 			console.error(JSON.stringify({ m: 'site-remote', fail: 'no ASSETS binding: a SITE_REMOTE build cannot serve its files' }));
-			throw new Error('SITE_REMOTE build without an ASSETS binding');
+			throw siteRefusal('no-assets', 'a SITE_REMOTE build without an ASSETS binding cannot serve its files');
+		}
+		// The lead's ruling on #570: OPcache OFF with remote sources cannot fit the fetch budget (every
+		// script compiles, so every source is read: woo.py's checkout passed the hard cap of 96). Refused,
+		// loudly, never a thrash.
+		if (!OPCACHE_REMOTE || ENV.OPCACHE_REMOTE === 'off') {
+			siteState = 'fail:opcache-off';
+			console.error(JSON.stringify({ m: 'site-remote', fail: 'OPCACHE_REMOTE is off: a SITE_REMOTE build needs the remote OPcache' }));
+			throw siteRefusal('opcache-off', 'a SITE_REMOTE build with OPcache off cannot fit the fetch budget');
 		}
 		const siteHold = intEnv(ENV.SITE_HOLD_KIB, 0, 65536, SITE_HOLD_BYTES / 1024) * 1024;
 		siteHooks = null;
@@ -1734,7 +1749,7 @@ async function boot(origin) {
 		} catch (e) {
 			siteState = 'fail:selfcheck';
 			console.error(JSON.stringify({ m: 'site-remote', fail: String((e && e.message) || e).slice(0, 300) }));
-			throw e;
+			throw siteRefusal('selfcheck', 'the boot self-check failed: SITE_REMOTE reads are not working');
 		}
 	}
 
@@ -3822,6 +3837,8 @@ async function handle(req, env, url, spikeOk, maxBody, ctx) {
 			// The stack names internal paths. It goes to the tail log for every caller, never to the body,
 			// so a leaked spike token cannot also leak stacks.
 			console.error(String((e && e.stack) || e));
+			// #569: a SITE_REMOTE boot refusal says why (a fixed code and text; no internal path).
+			if (e && e.siteRemoteRefused) return new Response('site unavailable: ' + e.siteRemoteRefused + '\n', { status: 503, headers: { 'x-site-remote-refused': e.siteRemoteRefused, 'cache-control': 'no-store' } });
 			return new Response('internal error', { status: 500 });
 		}
 	}
