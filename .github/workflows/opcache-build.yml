@@ -68,7 +68,8 @@ jobs:
           # #569 (SITE_REMOTE): site.zip to packs as well (it empties site.zip, so it runs last), then the
           # same three cases with the site served only from packs.
           python3 -I site-remote.py build/site.zip build/file-trace.json build/build-id.js
-          if ! REMOTE_E2E_SITE=1 tests/remote-e2e.sh; then
+          # MEASUREMENT (#569): the site held budget at 8192 KiB, to read the OPcache-off cases' fetches.
+          if ! REMOTE_E2E_SITE=1 REMOTE_E2E_SITE_HOLD=8192 tests/remote-e2e.sh; then
             echo "::error::remote-e2e.sh (site) failed; last lines of dev.log:"; tail -40 dev.log 2>/dev/null || true; exit 1
           fi
           echo "remote steps took $(( $(date +%s) - s )) s"

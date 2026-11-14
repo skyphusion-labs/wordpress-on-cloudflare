@@ -24,6 +24,9 @@ python3 -c "import zipfile,sys; sys.exit(0 if zipfile.ZipFile('build/opcache.zip
 # comes from st-<n>.zip / site-hot.zip packs. Every case then also needs site fetches with no failure
 # and nothing capped (OPcache off or capped at 0 must not touch the site: its cap is the hard one).
 SITE=${REMOTE_E2E_SITE:-0}
+# REMOTE_E2E_SITE_HOLD=<KiB> (#569): every site case also runs with SITE_HOLD_KIB=<KiB> (a measurement of
+# the site held budget, a CEILING: normal requests hold far less, opcache-build run 43611818118).
+SITE_HOLD=${REMOTE_E2E_SITE_HOLD:-}
 if [ "$SITE" = 1 ]; then
   python3 -c "import zipfile,sys; sys.exit(0 if zipfile.ZipFile('build/site.zip').namelist() == [] else 1)" || { echo "FAIL build/site.zip is not empty on a SITE_REMOTE build"; exit 1; }
   [ -s "build/public/_pf/$ID/st-0.zip" ] || { echo "FAIL build/public/_pf/$ID/st-0.zip is missing"; exit 1; }
@@ -60,6 +63,7 @@ run_case() { # run_case <label> <DEV_VARS> <python test on the perf_sum line>
   local label=$1 vars=$2 want=$3
   ./run.sh --stop >/dev/null 2>&1; [ -n "$STATE" ] && rm -rf "$STATE"
   STATE=$(mktemp -d "${TMPDIR:-/tmp}/remote-e2e.XXXXXX"); export PERSIST_TO=$STATE
+  [ "$SITE" = 1 ] && [ -n "$SITE_HOLD" ] && vars="${vars:+$vars }SITE_HOLD_KIB:$SITE_HOLD"
   DEV_LOCAL=1 DEV_VARS="$vars" ./run.sh _ping > /dev/null || { echo "FAIL $label: wrangler dev did not start"; bad=1; return; }
   curl -s "${ST[@]}" -X POST -H "x-admin-password: $PW" "$B/_install" > /dev/null
   curl -s "${ST[@]}" -X POST -H "x-admin-password: $PW" "$B/_activate?plugin=woocommerce/woocommerce.php" > /dev/null

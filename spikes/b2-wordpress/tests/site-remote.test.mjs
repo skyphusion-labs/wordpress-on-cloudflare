@@ -201,7 +201,9 @@ for (const [label, path, bytes] of [['a .php (pinned at its first READ)', '/word
 		const s = await site({ noPin: true });
 		const out = await s.run(HALF(path));
 		assert.match(out, /Read of \d+ bytes failed with errno=29/);
-		const got = Number(out.replace(/<[^>]*>/g, '').trim().split('\n').pop().split('|')[0]);
+		// The length is the number before "|<md5>|" (a match, not a tag strip: CodeQL flagged the strip).
+		const lm = out.match(/(\d+)\|[0-9a-f]{32}\|/);
+		const got = lm ? Number(lm[1]) : NaN;
 		assert.ok(Number.isFinite(got) && got > 0 && got < bytes.length, 'a short read: ' + got);
 	});
 }
