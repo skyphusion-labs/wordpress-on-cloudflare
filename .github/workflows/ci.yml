@@ -139,6 +139,8 @@ jobs:
         run: python3 -I spikes/b2-wordpress/tests/opcache-split-test.py
       - name: b-dosql every OPcache file to packs in cold-boot read order, opcache.zip empty, no boot pack (issue #563)
         run: python3 -I spikes/b2-wordpress/tests/opcache-remote-pack-test.py
+      - name: b-dosql the site.zip trace report reads hand-computed fetches right (issue #569)
+        run: python3 -I spikes/b2-wordpress/tests/site-trace-report-test.py
       - name: measure394 read-back states, a failed read is never an absent row (issue #519)
         run: python3 -I spikes/b2-wordpress/tests/measure394-state-test.py
       - name: b-dosql runtime guards, raw sockets and PHP messages (issue #452)

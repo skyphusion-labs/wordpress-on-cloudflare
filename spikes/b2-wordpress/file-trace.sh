@@ -36,6 +36,17 @@ for path in /wp-admin/ /wp-admin/profile.php '/wp-admin/post-new.php?post_type=p
   code=$(curl -s -c "$J" -b "$J" -o /dev/null -w '%{http_code}' "$B$path")
   echo "$code $path" >> build/file-trace-admin.log
 done
+# #569 (#394 Gate 2): the GET screens of the 7-screen round (docs/admin-memory-matrix.md,
+# admin-round.py), each COLD (POST /_install drops the runtime, so the next request boots one) then
+# warm. Post 1 and page 2 are the ones a WordPress install makes. The profile SAVE (a POST with a
+# nonce) is not traced.
+for path in /wp-admin/ /wp-admin/post-new.php '/wp-admin/post-new.php?post_type=page' '/wp-admin/post.php?post=1&action=edit' '/wp-admin/post.php?post=2&action=edit' /wp-admin/profile.php; do
+  curl "${ST[@]}" -s -X POST -H "x-admin-password: $PW" "$B/_install" > /dev/null
+  for pass in cold warm; do
+    code=$(curl -s -c "$J" -b "$J" -o /dev/null -w '%{http_code}' "$B$path")
+    echo "$code $pass $path" >> build/file-trace-admin.log
+  done
+done
 rm -f "$J"
 curl "${ST[@]}" -sf "$B/_trace" > build/file-trace.json
 python3 -c "import json,sys; d=json.load(open(sys.argv[1])); assert d['on'], 'FILE_TRACE was not on'; print('file-trace.json:', len(d['requests']), 'requests,', d['dropped'], 'dropped')" build/file-trace.json
