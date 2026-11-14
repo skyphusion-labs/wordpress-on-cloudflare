@@ -16,11 +16,11 @@ test('releaseRuntime clears lastBootedPhp and exits the runtime, never throwing'
 	assert.match(body, /try \{\s*php\.exit\(0\);\s*\} catch/);
 });
 
-test('the memory recycle marks the runtime, and drops it through dropRuntime (released after this run settles)', () => {
-	// #566: every drop goes through dropRuntime, which releases only once the PHP queue at the drop has
-	// settled. The recycle drops inside its own run, so the release comes after that run returned its
-	// response: the old "build, release, return" order, now enforced by the wait (drop-runtime.test.mjs).
-	const rec = src.indexOf("if (crashed || (wasmBytes > RECYCLE_WASM_BYTES && env.PHP_RECYCLE !== 'off')) {");
+test('the memory recycle (or a forced one) marks the runtime, and drops it through dropRuntime (released when its run ends)', () => {
+	// #566: every drop goes through dropRuntime. The recycle drops INSIDE its own run, so the runtime is
+	// queued and released synchronously when that run ends (withPhp's finally), after handle() returned
+	// its response: the old "build, release, return" order, with no promise continuation (drop-runtime.test.mjs).
+	const rec = src.indexOf("if (crashed || forceRecycle || (wasmBytes > RECYCLE_WASM_BYTES && env.PHP_RECYCLE !== 'off')) {");
 	assert.ok(rec >= 0, 'recycle block not found');
 	const block = src.slice(rec, src.indexOf('\n\t\t\t}', rec));
 	assert.match(block, /\n\t+dropRuntime\(\);/);
