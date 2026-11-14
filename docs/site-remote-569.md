@@ -24,7 +24,11 @@ leaves the bundle too.
 - **The boot.** `boot()` mounts every directory and one node per file. `stat()` needs no bytes.
 - **The hot pack** is fetched once per runtime and held for the runtime's life: a fixed cost of
   about 35 KiB of pack bytes per runtime (measured). The other packs are held under `SITE_HOLD_KIB`
-  (2048) with LRU, and dropped at the end of each request.
+  (default **8192**, a ceiling) with LRU, and dropped at the end of each request.
+  - Normal requests hold about 544 KiB.
+  - A compile boot (OPcache unable to serve, so every source is read) held 6,877 KiB on pf570m.
+  - 2048 thrashed that boot (87 fetches, and the checkout hit the cap of 96).
+  - The lead chose 8192 on the pf570m readings (see "The gate readings").
 - **There is NO runtime off switch** (the lead accepted it: the bytes are not in the bundle). The
   rollback path is explicit:
   - **`site update` without `SITE_REMOTE`** (with `DROP_SETTINGS=SITE_REMOTE`, because the setting is
@@ -150,9 +154,33 @@ leaves the bundle too.
   store, served only from packs, three ways.
 - **`deploy/wfp/tests/render-test.sh`:** `SITE_REMOTE` and its rule.
 
-## The proof (to run; nothing is claimed yet)
+## The gate readings
 
-Run it only AFTER rollins-sb1114b's `dropRuntime()` fix merges.
+Each line gives its link. "Local workerd" means CI's opcache-build, on the priming store; pf570m is the
+lead's throwaway WfP site on the sample store.
+
+| gate | reading | where |
+|---|---|---|
+| Gate 0 (open hook, production) | stock 3.1.62 PHP pauses in `__syscall_openat`; `ASSETS.fetch` counts as a subrequest | #394 issuecomment-6878010968 |
+| (iii), reads only | 193 site files read, 1 pack; **later corrected** | #394 issuecomment-6879197224 |
+| correction | the open hook fetched on OPENS; woo.py's checkout hit the cap of 96 (run 43608158287) | #394 issuecomment-6879576693 |
+| Gate 0b (read hook, production) | 9 of 9 cases x3: open with no read = 0 fetches; OPcache source-resolve = 0; SuspendError named | #394 issuecomment-6879785529 |
+| step 3, opens and reads | 37,721 of 37,721 opened-but-unread files were `.php`: the hybrid | #394 issuecomment-6879862441 |
+| hybrid e2e, 2048 | normal case PASS (rsN 2); OPcache-unavailable cases FAIL (87 fetches, cap hit) | run 43611818118 |
+| hybrid e2e, 8192 | every site case PASS, rsCapped 0; compile boot 55 fetches, 8,166 KiB held | run 43612610670 |
+| memory and refusal e2e | compile boot wasm1MiB 91; OPCACHE_REMOTE=off refused, 503 `opcache-off` | run 43613411444 |
+| memory gate (pf570m, cap0) | /_headroom reach **127, 108, 108 MiB** (line: 32); compile boot 14 fetches, 6,877 KiB, wasm 76 | #570 issuecomment-6880689593 |
+| normal-boot control (pf570m) | reach **112, 112 MiB**; 544 KiB held, wasm 74 | #570 issuecomment-6880882169 |
+
+**The exclusion rule for a headroom reading:** a reach counts as "after a boot" only when the probe's
+first line reads `rt` 1 or more and a numeric `wasmMiB`. On pf570m's control, round 1 read `rt` 0 and
+`wasmMiB` null: it ran on an object with no PHP runtime, an empty isolate (237 MiB), so it is excluded.
+All 3 cap0 rounds read `rt` 1 and `wasmMiB` 76.2.
+
+## The proof still to run (the 7-screen round)
+
+The memory gate above was read on pf570m. The 7-screen admin round on a SITE_REMOTE site is not run
+here; pf394a carries it. The dropRuntime() prerequisite is met (#571, #566 closed).
 
 1. On the sample store: (a) main plus `OPCACHE_REMOTE=1`, and (b) that plus `SITE_REMOTE=1`. Both
    have `HEADROOM_PROBE=on`.

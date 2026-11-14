@@ -35,7 +35,11 @@ export const REMOTE_HOLD_BYTES = 4096 * 1024;
 // #569 (Gate 2): site opens may go on to this per-request HARD cap (0.96 % of the Paid 10,000). The
 // measured cold admin request is about 44 fetches in all (#394 issuecomment-6879197224).
 export const SITE_FETCH_CAP = 96;
-export const SITE_HOLD_BYTES = 2048 * 1024;
+// #569: the site held budget, a CEILING (normal requests hold about 544 KiB). 2048 thrashed a compile
+// boot (OPcache unable to serve, so every source is read: 87 fetches, and the checkout hit the hard
+// cap). 8192 passed the cap (14 of 96), memory (a /_headroom reach of 108 MiB or more after a compile
+// boot, against the 32 MiB line) and normal requests, on pf570m (#570 issuecomment-6880689593, -6880882169).
+export const SITE_HOLD_BYTES = 8192 * 1024;
 
 async function sha256hex(bytes) {
 	const h = new Uint8Array(await crypto.subtle.digest('SHA-256', bytes));

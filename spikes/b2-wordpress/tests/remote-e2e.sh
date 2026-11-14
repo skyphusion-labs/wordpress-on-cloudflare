@@ -24,8 +24,8 @@ python3 -c "import zipfile,sys; sys.exit(0 if zipfile.ZipFile('build/opcache.zip
 # comes from st-<n>.zip / site-hot.zip packs. Every case then also needs site fetches with no failure
 # and nothing capped (OPcache off or capped at 0 must not touch the site: its cap is the hard one).
 SITE=${REMOTE_E2E_SITE:-0}
-# REMOTE_E2E_SITE_HOLD=<KiB> (#569): every site case also runs with SITE_HOLD_KIB=<KiB> (a measurement of
-# the site held budget, a CEILING: normal requests hold far less, opcache-build run 43611818118).
+# REMOTE_E2E_SITE_HOLD=<KiB> (#569): every site case also runs with SITE_HOLD_KIB=<KiB>, to measure another
+# site held budget (a CEILING). The default, 8192, was chosen on pf570m (#570 issuecomment-6880689593).
 SITE_HOLD=${REMOTE_E2E_SITE_HOLD:-}
 if [ "$SITE" = 1 ]; then
   python3 -c "import zipfile,sys; sys.exit(0 if zipfile.ZipFile('build/site.zip').namelist() == [] else 1)" || { echo "FAIL build/site.zip is not empty on a SITE_REMOTE build"; exit 1; }
