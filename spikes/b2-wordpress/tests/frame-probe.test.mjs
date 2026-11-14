@@ -74,3 +74,10 @@ test('index.js: the object answers /_frame BEFORE its public-origin guard (the p
 	assert.ok(guard > 0);
 	assert.ok(frame < guard, '/_frame is answered before the origin guard');
 });
+
+// The frame's close runs after x-perf is built (txnEnd follows handle()), so frame.own is the OPEN side
+// only. frame.ownTotal is the isolate's running count: the next request's value includes this close.
+test('index.js: x-perf frame carries the running ownTotal, so the close side can be measured', () => {
+	const src = readFileSync(new URL('../index.js', import.meta.url), 'utf8');
+	assert.match(src, /own: c\.own - frame0\.own, ownTotal: c\.own,/);
+});

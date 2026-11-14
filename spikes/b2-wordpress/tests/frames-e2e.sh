@@ -70,6 +70,23 @@ for kind in ('save', 'postnew', 'public'):
         if kind in ('save', 'postnew') and opened != len(p): ok = False; print('BAD %s: %d of %d opened a frame' % (kind, opened, len(p)))
         if kind == 'public' and written == 0 and opened: ok = False; print('BAD public: a frame opened on a request that wrote nothing')
     elif any(fr): ok = False; print('BAD %s: a frame field with frames off' % kind)
+# The FULL own rows of a framed request: its open (frame.own) plus its close, which lands after its
+# x-perf and shows in the NEXT request's running ownTotal (minus that request's own open). The loop
+# runs save, postnew, public in order, so each kind's next request is known. Same isolate only.
+seq = []
+for line in open(sys.argv[1]):
+    kind, h, v = line.split(' ', 2)
+    if h.lower().startswith('x-perf'):
+        v = v.split(': ', 1)[1].strip() if ': ' in v else v.strip()
+        seq.append((kind, json.loads(v).get('frame') or {}))
+full = {}
+for (k, a), (_, b) in zip(seq, seq[1:]):
+    if 'ownTotal' not in a or 'ownTotal' not in b: continue
+    close = b['ownTotal'] - b.get('own', 0) - a['ownTotal']
+    if close < 0: continue  # a new isolate: the running count restarted
+    full.setdefault(k, []).append(a.get('own', 0) + close)
+for k in ('save', 'postnew', 'public'):
+    if full.get(k): print('OWN-FULL %s %s n=%d own_full_med=%s' % (mode, k, len(full[k]), statistics.median(full[k])))
 print('OK' if ok else 'NOTOK')
 PY
   cat "$T/out"
