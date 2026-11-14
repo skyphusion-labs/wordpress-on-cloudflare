@@ -154,6 +154,8 @@ update_one_inner() {
   echo "site $s: upload build $new (was ${rollback:-unknown}); reason: $reasons"
   # WP_VECTORIZE_SEARCH (#330): the binding needs its index to exist at deploy (lib.sh).
   if search_on; then ensure_search_index "$s" || { rm -rf "$W"; [ -n "$SAVED" ] && rm -rf "$SAVED"; return 1; }; fi
+  # #569: a remote build is never uploaded without its ASSETS binding and /_pf/ first.
+  remote_assets_check "$CONF" "$APP" || { echo "site $s: update refused; nothing was uploaded" >&2; rm -rf "$W"; [ -n "$SAVED" ] && rm -rf "$SAVED"; return 2; }
   bundle_size_check || { rm -rf "$W"; [ -n "$SAVED" ] && rm -rf "$SAVED"; return 1; }
   # A failed upload changed nothing live; the log is read BEFORE the work dir goes.
   (cd "$APP" && "$WR" deploy --config "$CONF" --dispatch-namespace "$NAMESPACE" --secrets-file "$W/sec.json") > "$W/up.log" 2>&1 || { echo "site $s: upload failed:" >&2; tail -20 "$W/up.log" >&2; rm -rf "$W"; [ -n "$SAVED" ] && rm -rf "$SAVED"; return 1; }
@@ -207,7 +209,10 @@ update_one_inner() {
     fi
     cp "$CONF" "$SAVED/wrangler.rollback.toml"
     local W2; W2=$(mktemp -d)
-    if tfr site output -json | site_secrets_json "$W2/sec.json" && (cd "$SAVED" && "$RBWR" deploy --config "$SAVED/wrangler.rollback.toml" --dispatch-namespace "$NAMESPACE" --secrets-file "$W2/sec.json") > "$W2/rb.log" 2>&1; then
+    # #569: the rollback tree is a build too: a remote one needs its assets in this config.
+    if ! remote_assets_check "$SAVED/wrangler.rollback.toml" "$SAVED"; then
+      echo "site $s: the rollback was REFUSED: its build and this config do not fit (remote_assets_check above); deploy the old build by hand" >&2
+    elif tfr site output -json | site_secrets_json "$W2/sec.json" && (cd "$SAVED" && "$RBWR" deploy --config "$SAVED/wrangler.rollback.toml" --dispatch-namespace "$NAMESPACE" --secrets-file "$W2/sec.json") > "$W2/rb.log" 2>&1; then
       echo "site $s: re-deployed ${live_build:-unknown}"
       tfr site apply -input=false -auto-approve "${REC_VARS[@]}" -var "build=$live_build" -var "config_hash=$live_hash" >/dev/null || echo "site $s: the site map entry did not record the rollback build $live_build" >&2
       wait_build "$ORIGIN" "$TOK" "$live_build" || echo "site $s: /_build did not return to $live_build after the rollback re-deploy" >&2

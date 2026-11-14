@@ -424,6 +424,12 @@ opcache_remote_var() {
 # #569 (#394 Gate 2, SITE_REMOTE=1): site.zip leaves the bundle too, as packs PHP fetches while it
 # pauses in open() (site-remote.py, remote-packs.mjs). Only on top of OPCACHE_REMOTE=1: the same hook,
 # request budget, ASSETS binding and /_pf/ first. The var makes the config hash change with the flag.
+# remote_assets_check <rendered config> [app dir] (#569): refuse (exit 2) an upload of a remote build
+# (OPCACHE_REMOTE or SITE_REMOTE) whose config lacks the ASSETS binding or /_pf/ first, or whose
+# config and build disagree on SITE_REMOTE. Called before every user-script upload of a site build.
+remote_assets_check() {
+  python3 -I "$WFP/remote_assets_check.py" "$1" "${2:-$APP}"
+}
 site_remote_var() {
   case "${SITE_REMOTE:-0}" in
     0) ;;

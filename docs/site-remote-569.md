@@ -25,9 +25,21 @@ leaves the bundle too.
 - **The hot pack** is fetched once per runtime and held for the runtime's life: a fixed cost of
   about 35 KiB of pack bytes per runtime (measured). The other packs are held under `SITE_HOLD_KIB`
   (2048) with LRU, and dropped at the end of each request.
-- **There is NO runtime off switch.** The bytes are not in the bundle, so the rollback is a deploy
-  without `SITE_REMOTE`. A boot with no `ASSETS` binding fails loudly (`siteRemote`
-  `fail:no-assets-binding`), never a site without files.
+- **There is NO runtime off switch** (the lead accepted it: the bytes are not in the bundle). The
+  rollback path is explicit:
+  - **`site update` without `SITE_REMOTE`** (with `DROP_SETTINGS=SITE_REMOTE`, because the setting is
+    recorded, #558) rebuilds with `site.zip` back in the bundle;
+  - a bad remote build that went live is covered by **#466's rollback artifact**. `site update` stores
+    each deployed build and re-deploys the live one when an update fails.
+- **A remote build with no `ASSETS` binding is refused at DEPLOY time.** `remote_assets_check`
+  (`deploy/wfp/remote_assets_check.py`) runs before every user-script upload: `site add`, `site
+  update` and the rollback re-deploy.
+  - It refuses a build whose site or OPcache index is non-null when the config lacks `binding =
+    "ASSETS"` or `run_worker_first` with `/_pf/*`. Without the binding a site build has no files;
+    without `/_pf/` first the packs (PHP source and compiled PHP) would be public, #412.
+  - It also refuses a build and config that disagree on `SITE_REMOTE`.
+  - Tested: `deploy/wfp/tests/remote-assets-test.sh`.
+  - Boot still fails loudly too (`siteRemote` `fail:no-assets-binding`).
 
 ## Never a half file
 
@@ -52,7 +64,16 @@ leaves the bundle too.
   - OPcache opens stop at the SOFT cap, `REMOTE_FETCH_CAP` (64): past it they compile, which is free;
   - site opens go on to the HARD cap, `SITE_FETCH_CAP` (96): 0.96 % of the Workers Paid 10,000.
 - **Measured** (simulated, then scaled for the measured undercount): a cold admin request is about 44
-  fetches in all, OPcache about 42 and site 2.
+  fetches in all, OPcache about 42 and site 2. **This was measured on the PRIMING store** (e2e.sh
+  and tests/woo.py data) in CI, not the 2,609-product sample store; the proof re-measures it there.
+- **OPEN, found by the site e2e on workerd (opcache-build run 43608158287):** the hook fetches on
+  OPEN, but the trace counted READS. PHP opens site files it never reads; OPcache opens a source
+  to resolve it even when the script comes from its cache.
+  - So a cold boot made 88 site fetches over 14 distinct packs, where the trace predicted 1, and
+    tests/woo.py's checkout passed the hard cap of 96 (`{"m":"remote","kind":"rs","capped":96}`),
+    a 500.
+  - The design needs the lead's decision before this ships: fetch on the first READ instead of the
+    open. See the PR.
 
 ## `file_exists` storms only stat
 
@@ -97,6 +118,9 @@ Run it only AFTER rollins-sb1114b's `dropRuntime()` fix merges.
 
 1. On the sample store: (a) main plus `OPCACHE_REMOTE=1`, and (b) that plus `SITE_REMOTE=1`. Both
    have `HEADROOM_PROBE=on`.
+   - Read the WARM `rsN` per screen. Only the hot pack (about 35 KiB) is held across requests (the
+     lead's decision). If warm site fetches prove costly, holding the first 512 KiB pack across
+     requests too is a follow-up decision, made with these numbers.
 2. Run `/_headroom` 3x alternating, then the 7-screen round at +0, +20 and +60 min.
 3. **Pass line:**
    - **0 failed responses over the full round** (no 5xx from a site fetch);

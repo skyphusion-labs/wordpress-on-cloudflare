@@ -68,6 +68,8 @@ if [ "$cmd" = up ]; then
   tfr site output -json | site_secrets_json "$W/secrets.json"
   # WP_VECTORIZE_SEARCH (#330): the binding needs its index to exist at deploy.
   if search_on; then ensure_search_index "$s" || { rm -f "$W/secrets.json"; exit 1; }; fi
+  # #569: a remote build is never uploaded without its ASSETS binding and /_pf/ first.
+  remote_assets_check "$CONF" "$APP" || { rm -f "$W/secrets.json"; exit 2; }
   bundle_size_check || exit 1
   (cd "$APP" && "$ROOT/deploy/wr" deploy --config "$CONF" --dispatch-namespace "$NAMESPACE" --secrets-file "$W/secrets.json") > "$W/user.log" 2>&1 \
     || { rm -f "$W/secrets.json"; tail -20 "$W/user.log"; exit 1; }
