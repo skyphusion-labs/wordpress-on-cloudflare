@@ -32,7 +32,7 @@ import { loadPHPRuntime, PHP, PHPRequestHandler, setPhpIniEntries, __private__do
 import { inflateSync } from 'fflate';
 import { createArena } from './inflate-arena.mjs';
 import { headroomStream } from './headroom.mjs';
-import { dropAndRelease } from './runtime-drop.mjs';
+import { createRetirer } from './runtime-drop.mjs';
 import { Container, ContainerProxy, getContainer } from '@cloudflare/containers';
 import { DurableObject, WorkerEntrypoint } from 'cloudflare:workers';
 import siteZip from './build/site.zip';
@@ -202,14 +202,18 @@ function releaseRuntime(php) {
 		// already exited, or exit threw: nothing more to release
 	}
 }
-// #566: drop the runtime AND release it once every PHP run queued at the drop has settled (after
-// defaults to phpQueue), so it is never released mid-use. A bare `bootPromise = null` left the runtime
-// reachable through lastBootedPhp until the next boot: about 165 MiB per drop (#394). Every drop goes here.
-function dropRuntime(after) {
-	const boot = bootPromise;
+// #566: drop the runtime and RELEASE it, synchronously, at a point where nothing can be using it.
+// withPhp brackets every PHP run with retirer.runStart / runEnd (in finally, on the request's own awaited
+// path): a drop while a run executes queues the runtime, and the end of the last run releases it in that
+// call; a drop while idle releases at once. No promise continuation is involved, because workerd drops
+// those of a finished or aborted request (#568 chained one, and on pf394a the release never ran).
+let bootGen = 0; // bumped on every drop, so a boot that finishes after one knows it is an orphan
+const retirer = createRetirer(releaseRuntime);
+function dropRuntime() {
 	const held = lastBootedPhp;
+	bootGen++;
 	bootPromise = null;
-	return dropAndRelease({ boot, held, after: after || phpQueue, release: releaseRuntime });
+	retirer.retire(held);
 }
 // The admin memory trace of the request now running (#434, php/mem-trace.php): set by the
 // memTrace message at PHP shutdown, read once into the operator-only x-mem-trace header.
@@ -319,8 +323,13 @@ function withPhp(fn) {
 		]);
 		clearTimeout(timer);
 		if (stale && bootPromise) runtimeDrops++;
-		if (stale) dropRuntime(Promise.all([prev, phpQueue])); // the old runtime's state is unknown; the stale run may still use it
-		return fn();
+		if (stale) dropRuntime(); // the old runtime's state is unknown; the stale run still counts as running, so it is released when that run ends too
+		retirer.runStart();
+		try {
+			return await fn();
+		} finally {
+			retirer.runEnd();
+		}
 	})();
 	phpQueue = run.catch(() => {});
 	return run;
@@ -1318,6 +1327,7 @@ async function handleMessage(raw) {
 }
 
 async function boot(origin) {
+	const gen = bootGen; // #566: a drop during this boot makes its runtime an orphan
 	bootOrigin = origin;
 	// The origin is WP_HOME for this runtime: log it, so a wrong one is visible.
 	console.log(JSON.stringify({ m: 'boot', origin }));
@@ -1605,6 +1615,9 @@ async function boot(origin) {
 		cookieStore: false,
 		getFileNotFoundAction: () => ({ type: 'internal-redirect', uri: '/index.php' }),
 	});
+	// #566: dropped while booting: nothing will reuse this runtime, but whoever awaited this boot may still use
+	// it now, so it is only queued, and the end of the next PHP run releases it.
+	if (gen !== bootGen) retirer.retire(php, true);
 	return { php, handler, bootMs: { wasm: tWasm, site: tSite, files: tFiles, fileCount: count, fileBytes, opcacheFiles, memAt } };
 }
 
@@ -3604,11 +3617,13 @@ async function handle(req, env, url, spikeOk, maxBody, ctx) {
 			// recycled (measured 2026-11-06: 3 recycles at 119 MiB with WooCommerce and
 			// All-in-One WP Migration). A crashed runtime is still dropped.
 			let recycled = null;
-			if (crashed || (wasmBytes > RECYCLE_WASM_BYTES && env.PHP_RECYCLE !== 'off')) {
+			// #566 verification: x-runtime-recycle: force (spike-gated) recycles this runtime as a memory recycle would.
+			const forceRecycle = spikeOk && req.headers.get('x-runtime-recycle') === 'force';
+			if (crashed || forceRecycle || (wasmBytes > RECYCLE_WASM_BYTES && env.PHP_RECYCLE !== 'off')) {
 				runtimeDrops++;
-				dropRuntime(); // #566: released once this run (the response below) has settled
+				dropRuntime(); // #566: queued (this run is executing); released when the run ends, after the response below is built
 				recycled = php;
-				out.set('x-runtime-recycled', crashed ? 'crashed' : 'memory');
+				out.set('x-runtime-recycled', crashed ? 'crashed' : forceRecycle ? 'forced' : 'memory');
 			}
 			if (ctx && ctx.inObject) {
 				runtimeServed++;
