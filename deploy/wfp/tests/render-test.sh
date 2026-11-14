@@ -175,5 +175,12 @@ ok "unsplit: [assets] is the directory only" "$(env -u OPCACHE_SPLIT bash -c ". 
 ok "OPCACHE_SPLIT=0: [assets] is the directory only" "$(OPCACHE_SPLIT=0 render_user one https://wp-one.sub.workers.dev | assets | grep -qx '{"directory": "build/public"}' && echo 1 || echo 0)"
 ok "OPCACHE_SPLIT=1: the ASSETS binding and run_worker_first /_pf/*" "$(OPCACHE_SPLIT=1 render_user one https://wp-one.sub.workers.dev | assets | grep -qx '{"binding": "ASSETS", "directory": "build/public", "run_worker_first": \["/_pf/\*"\]}' && echo 1 || echo 0)"
 ok "OPCACHE_SPLIT=2 fails the render" "$(OPCACHE_SPLIT=2 render_user one https://wp-one.sub.workers.dev >/dev/null 2>&1 && echo 0 || echo 1)"
+# OPCACHE_REMOTE (#563): the var only on a remote build, and only with the split.
+ocr() { "$PY" -c 'import json, sys, tomllib; print(json.dumps(tomllib.loads(sys.stdin.read())["vars"].get("OPCACHE_REMOTE")))'; }
+ok "no OPCACHE_REMOTE var by default" "$(env -u OPCACHE_REMOTE OPCACHE_SPLIT=1 bash -c ". '$LIB'; render_user one https://wp-one.sub.workers.dev" | ocr | grep -qx 'null' && echo 1 || echo 0)"
+ok "OPCACHE_REMOTE=0: no var" "$(OPCACHE_REMOTE=0 OPCACHE_SPLIT=1 render_user one https://wp-one.sub.workers.dev | ocr | grep -qx 'null' && echo 1 || echo 0)"
+ok "OPCACHE_REMOTE=1 with the split renders it" "$(OPCACHE_REMOTE=1 OPCACHE_SPLIT=1 render_user one https://wp-one.sub.workers.dev | ocr | grep -qx '"on"' && echo 1 || echo 0)"
+ok "OPCACHE_REMOTE=1 without the split fails the render" "$(OPCACHE_REMOTE=1 OPCACHE_SPLIT=0 render_user one https://wp-one.sub.workers.dev >/dev/null 2>&1 && echo 0 || echo 1)"
+for bad in 2 on yes; do ok "OPCACHE_REMOTE=$bad fails the render" "$(OPCACHE_REMOTE=$bad OPCACHE_SPLIT=1 render_user one https://wp-one.sub.workers.dev >/dev/null 2>&1 && echo 0 || echo 1)"; done
 echo "$fails failing check(s)"
 exit $fails
