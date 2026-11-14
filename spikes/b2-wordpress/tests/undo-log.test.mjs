@@ -447,3 +447,53 @@ test('counts.own: the rows the frame itself writes, exactly; a no-op that took i
 	// close: active 1 -> 0 (1) + the 2 undo rows cleared (2) + the _wp_frame row updated (1)
 	assert.equal(u.counts().own - atOpen, 4, 'close');
 });
+
+// The lead's ruling (pf352f point case, 2026-11-14): a request killed after a commit point, with no write
+// after it, left its frame row 'open' (frameKeep writes 'open' at a point; nothing was active, so recovery
+// had nothing to undo or relabel). Relabel at RECOVERY: a row still 'open' when an isolate starts belongs
+// to a request of a dead isolate. That costs a write only after a reset, never on the normal path.
+test('RECOVERY relabels a frame left open by a dead isolate (point case): ended-at-reset, never open', () => {
+	const { db, storage } = site();
+	const a = isolate();
+	a.u.arm(db, 'e1');
+	run(a.u, db, "INSERT INTO t (v) VALUES ('A')");
+	a.u.commitPoint(db, 'ddl');
+	assert.equal(a.u.status(db, 'e1').state, 'open', 'the instrument: open while the request runs');
+	// The isolate dies here, after the point and before any further write: nothing is active.
+	const logs = [];
+	const b = createUndoLog({ stats: { txnOps: 0, undoRows: 0 }, log: (o) => logs.push(o), frames: true });
+	b.recover(db, storage);
+	assert.deepEqual(ids(db), ['seed', 'A'], 'A, before the point, is kept');
+	const s = b.status(db, 'e1');
+	assert.equal(s.state, 'ended-at-reset');
+	assert.equal(s.points, 1);
+	assert.equal(s.undone, 0);
+	assert.equal(logs.find((l) => l.m === 'frame-recover').relabeled, 1);
+});
+
+test('RECOVERY with an active frame: the rolled-back one is labeled rolled-back, an older open one ended-at-reset', () => {
+	const { db, storage } = site();
+	const a = isolate();
+	a.u.arm(db, 'e2');
+	run(a.u, db, "INSERT INTO t (v) VALUES ('A')");
+	a.u.commitPoint(db, 'ddl'); // e2 left 'open' (its isolate will die below without recovery seeing it)
+	// a second isolate never ran recovery for e2 (as if frames were off then): simulate with a later request
+	const c = isolate();
+	c.u.arm(db, 'e3');
+	run(c.u, db, "INSERT INTO t (v) VALUES ('B')");
+	isolate().u.recover(db, storage);
+	assert.equal(isolate().u.status(db, 'e3').state, 'rolled-back');
+	assert.equal(isolate().u.status(db, 'e2').state, 'ended-at-reset');
+});
+
+test('a clean request never pays the relabel: recovery with nothing open writes no frame row', () => {
+	const { db, storage } = site();
+	const a = isolate();
+	a.u.arm(db, 'e4');
+	run(a.u, db, "INSERT INTO t (v) VALUES ('A')");
+	a.u.end(db);
+	const b = isolate();
+	b.u.recover(db, storage);
+	assert.equal(b.u.counts().own, 0, 'no row written by a recovery that found nothing');
+	assert.equal(b.u.status(db, 'e4').state, 'kept');
+});
