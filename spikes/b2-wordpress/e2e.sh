@@ -26,7 +26,7 @@ get() { curl -s -c "$J" -b "$J" -o "$T/body" -D "$H" -w '%{time_total}' "$B$2" >
 # load-scripts.php with a cache of one year, so a page must not ask for it at all: a browser
 # that kept the empty answer would keep using it.
 scripts_ok() {
-  local label=$1 u code size n=0
+  local label=$1 u code size out n=0
   if grep -qE 'load-(scripts|styles)\.php' "$T/body"; then echo "   $label asks for load-scripts.php or load-styles.php (#578)"; bad=1; fi
   for u in $(python3 -c "
 import html, re, sys
@@ -38,7 +38,11 @@ for s in sorted(set(html.unescape(m) for m in found)):
     elif s.startswith('/') and not s.startswith('//'): print(b + s)
 " "$B" "$T/body"); do
     n=$((n + 1))
-    read -r code size < <(curl -s -b "$J" -o /dev/null -w '%{http_code} %{size_download}\n' "$u")
+    # Command substitution, not `read < <(...)`: macOS /bin/bash 3.2 keeps each process
+    # substitution's descriptor open until the function returns, so ~256 assets in one call
+    # exhausted the descriptor limit and the build died with SIGTRAP (Trace/BPT trap: 5).
+    out=$(curl -s -b "$J" -o /dev/null -w '%{http_code} %{size_download}' "$u")
+    code=${out%% *}; size=${out##* }
     if [ "$code" != 200 ] || [ "$size" -lt 32 ]; then echo "   $label file answered $code with $size bytes: $u"; bad=1; fi
   done
   echo "$label: $n scripts and stylesheets from this site checked"

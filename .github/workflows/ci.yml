@@ -47,6 +47,15 @@ jobs:
           for f in spikes/b1-boot/index.js spikes/b2-wordpress/index.js spikes/b2-wordpress/sql-import.js spikes/c1-woo-container/worker.js spikes/c1-woo-container/warm.js; do cp "$f" "$RUNNER_TEMP/check.mjs" && node --check "$RUNNER_TEMP/check.mjs"; done
       - name: Shell syntax
         run: for f in $(git ls-files '*.sh'); do bash -n "$f"; done
+      - name: No process substitution in the macOS-run scripts (macOS /bin/bash 3.2 leaks one fd each)
+        run: |
+          set -u
+          # e2e.sh and the build scripts run on an operator's Mac under /bin/bash 3.2, where `< <(...)`
+          # inside a function keeps a descriptor open until the function returns. #578's asset loop hit
+          # the limit and the local build died with SIGTRAP. CI's bash 5 cannot see that, so refuse the form.
+          hits=$(grep -nE '<[[:space:]]*<\(' spikes/b2-wordpress/*.sh deploy/wfp/*.sh deploy/wfp/site | grep -vE '^[^:]+:[0-9]+:[[:space:]]*#' || true)
+          if [ -n "$hits" ]; then echo "process substitution found:"; echo "$hits"; exit 1; fi
+          echo "no process substitution in the macOS-run scripts"
       - name: Release bundle manifest (issue #405)
         # deploy/release: the manifest the one-click admin checks a downloaded bundle against. Offline.
         run: node deploy/release/tests/bundle-manifest-test.mjs
