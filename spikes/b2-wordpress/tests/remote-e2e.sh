@@ -40,6 +40,8 @@ for line in open(sys.argv[1]):
     for k in s: s[k] += int(d.get(k, 0))
     if d.get('boot') == 1: remote = d.get('remote')
     held = max(held, int(d.get('rfHeldKiB', 0)))
+    # Per page, for the fetch budget (#563): did it boot, how many packs, the held high-water.
+    print('page %d: boot=%s rt=%s rtServed=%s rfN=%s rfHeldKiB=%s opMisses=%s' % (n, d.get('boot'), d.get('rt'), d.get('rtServed'), d.get('rfN'), d.get('rfHeldKiB'), d.get('opMisses')), file=sys.stderr)
 # The remote state has spaces ("packs 21 files 2128 cap 64 holdKiB 2048"): one token, so the
 # key=value line splits cleanly (a run of the first shape failed here on a correct reading).
 print('pages=%d rfN=%d rfFail=%d rfCapped=%d heldKiB=%d remote=%s' % (n, s['rfN'], s['rfFail'], s['rfCapped'], held, str(remote).replace(' ', '_')))
