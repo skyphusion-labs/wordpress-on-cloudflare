@@ -23,6 +23,25 @@ export function resetFailures(failures) {
 export const WRITE_LOSS_MESSAGE = 'The request did not complete, and some changes may have been saved. Check before you try again.';
 export const WRITE_LOSS_BODY = WRITE_LOSS_MESSAGE + '\n';
 export const WRITE_LOSS_CODE = 'skyphusion_write_loss';
+// #352: the request frame was rolled back, PROVEN by the object's /_frame probe (state rolled-back, no
+// commit point passed): nothing of the request was kept, so a retry is safe. Never sent without the proof.
+export const ROLLED_BACK_MESSAGE = 'The request did not complete. Nothing was saved. You can try again.';
+/** The #352 answer when the frame is proven rolled back: still a 500, never a 302 with half a save. */
+export function rolledBackResponse(json = false, kind = 'memory', undone = 0) {
+	const headers = {
+		'content-type': json ? 'application/json; charset=utf-8' : 'text/plain; charset=utf-8',
+		'cache-control': 'no-store',
+		'x-isolate-reset': kind === 'storage' ? 'storage' : 'memory',
+		'x-write-loss': 'rolled-back',
+		'x-write-undone': String(Number(undone) || 0),
+	};
+	const body = json ? JSON.stringify({ code: WRITE_LOSS_CODE, message: ROLLED_BACK_MESSAGE, data: { status: 500, rolledBack: true } }) : ROLLED_BACK_MESSAGE + '\n';
+	return { status: 500, headers, body };
+}
+/** Whether a /_frame answer PROVES the request kept nothing: rolled back, and no commit point passed. */
+export function frameProvesRollback(frame) {
+	return !!(frame && frame.state === 'rolled-back' && Number(frame.points) === 0);
+}
 
 /**
  * An API call gets JSON (the lead's ruling): a REST route (/wp-json/ or ?rest_route=) or a client

@@ -19,7 +19,7 @@ import { cfBridgeEnabled, aiEmbedOp, vectorizeOp } from './cf-bridge.mjs';
 import { demoLocked, lockDefines } from './site-lock.mjs';
 import { exportRequest } from './mysql-export.mjs';
 import { perfHeadersAllowed, scrubPerfHeaders, isOperatorRequest, noStoreAnywhere, operatorNoStore } from './perf-headers.mjs';
-import { resetFailures, writeLossResponse, wantsJson, heldRequestMail, sqlShape } from './write-loss.mjs';
+import { resetFailures, writeLossResponse, rolledBackResponse, frameProvesRollback, wantsJson, heldRequestMail, sqlShape } from './write-loss.mjs';
 import { MEMORY_RESET } from './object-error.mjs';
 import { createL2Writer } from './oc-l2-writer.mjs';
 import { createLedger, memfsBytes, createSqlMeter, ledgerOn, LEDGER_MIB } from './mem-ledger.mjs';
@@ -32,6 +32,7 @@ import { loadPHPRuntime, PHP, PHPRequestHandler, setPhpIniEntries, __private__do
 import { inflateSync } from 'fflate';
 import { createArena } from './inflate-arena.mjs';
 import { headroomStream } from './headroom.mjs';
+import { createUndoLog } from './undo-log.mjs';
 import { createRetirer } from './runtime-drop.mjs';
 import { Container, ContainerProxy, getContainer } from '@cloudflare/containers';
 import { DurableObject, WorkerEntrypoint } from 'cloudflare:workers';
@@ -165,15 +166,15 @@ async function objectCacheOp(op) {
 	}
 	if (op.op === 'set') {
 		ocCount(op.k, "set");
-		if (txnFrames) txnTouched.add(op.k);
+		if (undoLog) undoLog.touch(op.k);
 		const n = op.k.length + op.v.length;
 		if (n > OBJECT_CACHE_BYTES / 4) return { ok: false };
 		ocStore(op.k, op.v, op.ttl > 0 ? now + op.ttl * 1000 : 0);
-		if (l2 && ocCtx) { const ttl = Math.max(60, op.ttl > 0 ? op.ttl : 60); try { const w = ocL2Writer().set(ocKvKey(op.k), op.v, ttl); if (w) ocCtx.waitUntil(w); } catch {} }
+		if (l2 && ocCtx) { const ttl = Math.max(60, op.ttl > 0 ? op.ttl : 60); const k2 = ocKvKey(op.k), v2 = op.v, c2 = ocCtx; const doSet = () => { try { const w = ocL2Writer().set(k2, v2, ttl); if (w) c2.waitUntil(w); } catch {} }; if (!(undoLog && undoLog.defer(doSet))) doSet(); } // #352: held until the frame is kept
 		return { ok: true };
 	}
 	if (op.op === 'del') {
-		if (txnFrames) for (const k of op.k) txnTouched.add(k);
+		if (undoLog) for (const k of op.k) undoLog.touch(k);
 		let n = 0;
 		for (const k of op.k) { ocCount(k, "del"); if (objectCacheDrop(k)) n++; if (l2 && ocCtx) { try { ocCtx.waitUntil(ocL2Writer().del(ocKvKey(k))); } catch {} } }
 		return { n };
@@ -1917,11 +1918,14 @@ async function r2opInner(op) {
 			return o ? { ok: true, found: true, size: o.size, mtime: Math.floor(o.uploaded.getTime() / 1000) } : { ok: true, found: false };
 		}
 		if (op.op === 'put') {
+			// #352: a put may become an orphan if the request rolls back (its attachment rows go). Logged for the sweep.
+			if (undoLog && undoLog.frameOpen()) console.log(JSON.stringify({ m: 'frame-r2-put', key: String(op.key).slice(0, 200) }));
 			await B.put(op.key, b64decode(op.body), { httpMetadata: { contentType: op.type || 'application/octet-stream' } });
 			return { ok: true };
 		}
 		if (op.op === 'copy') {
 			// Copy inside R2 (rename, staged uploads). The bytes never go to PHP.
+			if (undoLog && undoLog.frameOpen() && sqlDb) undoLog.commitPoint(sqlDb, 'r2-copy'); // #352: may replace bytes
 			const o = await B.get(op.from);
 			if (!o) return { ok: true, found: false };
 			await B.put(op.to, o.body, { httpMetadata: { contentType: op.type || o.httpMetadata?.contentType || 'application/octet-stream' } });
@@ -1929,6 +1933,7 @@ async function r2opInner(op) {
 			return { ok: true, found: true };
 		}
 		if (op.op === 'delete') {
+			if (undoLog && undoLog.frameOpen() && sqlDb) undoLog.commitPoint(sqlDb, 'r2-delete'); // #352: the bytes are gone
 			await B.delete(op.key);
 			return { ok: true };
 		}
@@ -2150,6 +2155,8 @@ function httpRefusal(url) {
 }
 async function httpOp(op) {
 	stats.httpCalls++;
+	// #352: an outbound call that is not a read is seen by others: a commit point (keep what came before).
+	if (undoLog && undoLog.frameOpen() && sqlDb && !/^(GET|HEAD|OPTIONS)$/i.test(String(op.method || 'GET'))) undoLog.commitPoint(sqlDb, 'http');
 	const t0 = Date.now();
 	let url;
 	let out;
@@ -2233,173 +2240,37 @@ async function httpOp(op) {
 	}
 }
 
-// Real SQL transactions for PHP with the database in the object (#60,
-// php/real-transactions.php, docs/approach-b.md 8l). The object's SQL API
-// refuses BEGIN and SAVEPOINT, and a storage transaction held open across
-// awaits neither captures statements made outside its callback nor survives an
-// outbound fetch (measured). So this uses SQLite's documented undo technique
-// ("Automatic Undo/Redo Using SQLite"): while PHP has a transaction open,
-// triggers write the inverse SQL of each row change to _wp_undo, and ROLLBACK
-// runs it back, newest first. All writes stay ordinary statements, so awaits,
-// uploads and outbound HTTP during a transaction are no problem.
-// - Triggers exist per table (named by a hash of the table and its columns),
-//   made at the first BEGIN and checked again only when the schema changes
-//   (schemaSig). They do nothing unless _wp_undo_state.active is 1.
-// - Tables WITHOUT ROWID are not covered (none in WordPress or the driver).
-// - A transaction still open at the end of a request is rolled back (MySQL
-//   does this when a connection closes). One left open by an isolate that
-//   died is rolled back at the next request (active is stored).
-// - Object cache keys written during the transaction are dropped on a
-//   rollback, so no cached value outlives the rows it came from.
-const UNDO_TABLES = new Set(['_wp_undo', '_wp_undo_state']);
-// A signature of sqlite_master (entries and the length of their SQL): any DDL
-// changes it. PRAGMA schema_version would be the direct way, but the object's
-// SQLite refuses it (SQLITE_AUTH, measured 2026-11-06).
-let undoSchemaSig = null;
-function schemaSig(db) {
-	const r = db.exec('SELECT COUNT(*) AS n, TOTAL(LENGTH(sql)) AS l FROM sqlite_master').one();
-	return r.n + ':' + r.l;
-}
-let txnFrames = null; // [{ name, seq }]: the transaction (name null) and its savepoints
-const txnTouched = new Set();
-function sqlId(name) {
-	return '"' + String(name).replace(/"/g, '""') + '"';
-}
-function sqlLit(text) {
-	return "'" + String(text).replace(/'/g, "''") + "'";
-}
-function shortHash(text) {
-	let h = 5381;
-	for (let i = 0; i < text.length; i++) h = ((h * 33) ^ text.charCodeAt(i)) >>> 0;
-	return h.toString(16).padStart(8, '0');
-}
-function undoSetup(db) {
-	db.exec('CREATE TABLE IF NOT EXISTS _wp_undo (seq INTEGER PRIMARY KEY AUTOINCREMENT, sql TEXT NOT NULL)');
-	db.exec('CREATE TABLE IF NOT EXISTS _wp_undo_state (id INTEGER PRIMARY KEY CHECK (id = 1), active INTEGER NOT NULL)');
-	db.exec('INSERT OR IGNORE INTO _wp_undo_state (id, active) VALUES (1, 0)');
-}
-function undoTriggers(db) {
-	if (schemaSig(db) === undoSchemaSig) return;
-	const tables = [...db.exec("SELECT name, sql FROM sqlite_master WHERE type = 'table' AND name NOT LIKE 'sqlite\\_%' ESCAPE '\\' AND name NOT LIKE '\\_cf\\_%' ESCAPE '\\'").raw()].filter(([name, sql]) => !UNDO_TABLES.has(name) && !/WITHOUT\s+ROWID/i.test(sql || ''));
-	const existing = new Set([...db.exec("SELECT name FROM sqlite_master WHERE type = 'trigger' AND name LIKE '\\_wp\\_undo\\_%' ESCAPE '\\'").raw()].map((r) => r[0]));
-	const want = new Set();
-	const when = 'WHEN (SELECT active FROM _wp_undo_state WHERE id = 1) = 1';
-	for (const [table] of tables) {
-		const cols = [...db.exec(`PRAGMA table_info(${sqlId(table)})`).raw()].map((r) => r[1]);
-		if (!cols.length) continue;
-		// The name hashes the whole trigger body, so a changed body (a new release, a new column) gets a new
-		// name: the old trigger is dropped below and the new one is created. Never keep a trigger by table name alone.
-		const t = sqlId(table);
-		const bodies = {
-			i: `AFTER INSERT ON ${t} ${when} BEGIN INSERT INTO _wp_undo (sql) VALUES (${sqlLit(`DELETE FROM ${t} WHERE rowid = `)} || new.rowid); END`,
-			u: `AFTER UPDATE ON ${t} ${when} BEGIN INSERT INTO _wp_undo (sql) VALUES (${sqlLit(`UPDATE ${t} SET rowid = `)} || old.rowid || ${cols.map((c) => `${sqlLit(`, ${sqlId(c)} = `)} || quote(old.${sqlId(c)})`).join(' || ')} || ${sqlLit(' WHERE rowid = ')} || new.rowid); END`,
-			d: `AFTER DELETE ON ${t} ${when} BEGIN INSERT INTO _wp_undo (sql) VALUES (${sqlLit(`INSERT INTO ${t} (rowid, ${cols.map(sqlId).join(', ')}) VALUES (`)} || old.rowid || ${cols.map((c) => `${sqlLit(', ')} || quote(old.${sqlId(c)})`).join(' || ')} || ')'); END`,
-		};
-		for (const [kind, body] of Object.entries(bodies)) {
-			const name = `_wp_undo_${shortHash(table + '\u0000' + body)}_${kind}`;
-			want.add(name);
-			if (!existing.has(name)) db.exec(`CREATE TRIGGER ${name} ${body}`);
-		}
-	}
-	for (const name of existing) if (!want.has(name)) db.exec(`DROP TRIGGER IF EXISTS ${sqlId(name)}`);
-	undoSchemaSig = schemaSig(db);
-}
-function undoSeq(db) {
-	return db.exec('SELECT COALESCE(MAX(seq), 0) AS s FROM _wp_undo').one().s;
-}
-function setUndoActive(db, on) {
-	db.exec('UPDATE _wp_undo_state SET active = ? WHERE id = 1', on ? 1 : 0);
-}
-// Undo every change after seq, newest first, in one storage transaction.
-function undoTo(db, storage, seq) {
-	setUndoActive(db, false);
-	const rows = [...db.exec('SELECT sql FROM _wp_undo WHERE seq > ? ORDER BY seq DESC', seq).raw()];
-	storage.transactionSync(() => {
-		for (const [stmt] of rows) db.exec(stmt);
-		db.exec('DELETE FROM _wp_undo WHERE seq > ?', seq);
-	});
-	stats.undoRows += rows.length;
-	for (const k of txnTouched) objectCacheDrop(k);
-	txnTouched.clear();
-	return rows.length;
-}
-function txnClose(db) {
-	setUndoActive(db, false);
-	db.exec('DELETE FROM _wp_undo');
-	txnFrames = null;
-	txnTouched.clear();
+// Real SQL transactions for PHP with the database in the object (#60) and the REQUEST FRAME on the
+// same undo log (#352, REQUEST_FRAMES=on): undo-log.mjs, where the design and the tests live
+// (tests/undo-log.test.mjs). One instance per isolate: recover() runs once, in the PhpRuntime
+// constructor, before anything reads the database.
+let undoLog = null;
+function undo(env = ENV) {
+	// frames is asked at each arm, from the env of the call or ENV: the first undo() of a deployed object is
+	// the constructor's recovery, before any fetch has set ENV (pf352f, 2026-11-14: no frame ever armed).
+	if (!undoLog) undoLog = createUndoLog({ stats, objectCacheDrop, log: (o) => console.log(JSON.stringify(o)), frames: () => !!((env || ENV) && (env || ENV).REQUEST_FRAMES === 'on') });
+	return undoLog;
 }
 function txnOp(db, storage, op) {
-	stats.txnOps++;
-	try {
-		const kind = op.op;
-		if (kind === 'begin') {
-			if (txnFrames) txnClose(db); // MySQL commits an open transaction first
-			undoSetup(db);
-			undoTriggers(db);
-			txnFrames = [{ name: null, seq: undoSeq(db) }];
-			txnTouched.clear();
-			setUndoActive(db, true);
-			return { ok: true };
-		}
-		if (kind === 'commit' || kind === 'ddl') {
-			if (txnFrames) txnClose(db); // DDL: MySQL's implicit commit
-			return { ok: true };
-		}
-		if (kind === 'rollback') {
-			if (!txnFrames) return { ok: true };
-			const n = undoTo(db, storage, txnFrames[0].seq);
-			txnClose(db);
-			return { ok: true, undone: n };
-		}
-		if (!txnFrames) return { ok: true }; // a savepoint outside a transaction does nothing (MySQL autocommit)
-		const at = txnFrames.findIndex((f, i) => i > 0 && f.name === op.name);
-		if (kind === 'savepoint') {
-			if (at > 0) txnFrames.splice(at, 1); // MySQL: the same name replaces the old savepoint
-			txnFrames.push({ name: op.name, seq: undoSeq(db) });
-			return { ok: true };
-		}
-		if (at < 0) return { ok: false, error: `SAVEPOINT ${op.name} does not exist` };
-		if (kind === 'rollback_to') {
-			const n = undoTo(db, storage, txnFrames[at].seq);
-			txnFrames.length = at + 1; // the savepoint stays, later ones go
-			setUndoActive(db, true);
-			return { ok: true, undone: n };
-		}
-		if (kind === 'release') {
-			txnFrames.length = at; // it and the later ones go; their changes stay in the transaction
-			return { ok: true };
-		}
-		return { ok: false, error: 'unknown transaction op ' + kind };
-	} catch (e) {
-		return { ok: false, error: String((e && e.message) || e) };
-	}
+	return undo().txnOp(db, storage, op);
 }
-// Before the first PHP run of an isolate: a transaction left open by an isolate
-// that died is rolled back. Within one isolate, txnEnd() always closes it, so
-// this runs once per isolate.
-let txnRecovered = false;
 function txnRecover(db, storage) {
-	if (txnRecovered || txnFrames) return;
-	txnRecovered = true;
-	let active = 0;
 	try {
-		active = db.exec('SELECT active FROM _wp_undo_state WHERE id = 1').one().active;
-	} catch {
-		return; // no undo tables yet: no transaction was ever opened
-	}
-	if (active) {
-		const n = undoTo(db, storage, 0);
-		txnClose(db);
-		console.log(JSON.stringify({ m: 'txn', recovered: true, undone: n }));
+		return undo().recover(db, storage);
+	} catch (e) {
+		console.error(JSON.stringify({ m: 'txn', recoverFailed: String((e && e.message) || e).slice(0, 200) }));
+		return null;
 	}
 }
-// After a PHP run: a transaction still open is rolled back (MySQL on connection close).
+// After a PHP run: a PHP transaction still open is rolled back (MySQL on connection close), and a frame is
+// KEPT. A run that saw an isolate reset cannot write any more: the frame stays open in storage, and the
+// next isolate rolls it back (that is the point), so a failure here is logged, never thrown.
 function txnEnd(db, storage) {
-	if (!txnFrames) return;
-	const n = undoTo(db, storage, txnFrames[0].seq);
-	txnClose(db);
-	console.log(JSON.stringify({ m: 'txn', rolledBackAtEnd: true, undone: n }));
+	try {
+		undo().end(db, storage);
+	} catch (e) {
+		console.error(JSON.stringify({ m: 'txn', endFailed: String((e && e.message) || e).slice(0, 200) }));
+	}
 }
 
 // Spike: time N statements on the object's SQLite (db=object) or on D1 (db=d1),
@@ -2467,28 +2338,11 @@ function sqlStatement(db, m) {
 	stats.calls++;
 	try {
 		const params = sqlParams(m.params);
-		const returnsRows = /^\s*(SELECT|PRAGMA|WITH|VALUES|EXPLAIN)\b/i.test(m.sql) || /\bRETURNING\b/i.test(m.sql);
-		let reply;
-		if (returnsRows) {
-			const cur = db.exec(m.sql, ...params);
-			const rows = [...cur.raw()];
-			// Billed units (Durable Objects pricing): rows read and written.
-			stats.rowsRead += cur.rowsRead;
-			stats.rowsWritten += cur.rowsWritten;
-			let blob = false;
-			for (const row of rows) blob = sqlRow(row) || blob;
-			reply = { ok: true, columns: cur.columnNames || [], rows, changes: 0, last_row_id: 0, blob };
-		} else {
-			let changes = 0;
-			changes = sqlChanges(db, () => {
-				const cur = db.exec(m.sql, ...params);
-				cur.toArray();
-				stats.rowsRead += cur.rowsRead;
-				stats.rowsWritten += cur.rowsWritten;
-			});
-			const insert = changes > 0 && /^\s*(INSERT|REPLACE)\b/i.test(m.sql);
-			reply = { ok: true, columns: [], rows: [], changes, last_row_id: insert ? db.exec('SELECT last_insert_rowid()').raw().next().value[0] : 0 };
-		}
+		// #352: the statement runs through the undo log. The request frame opens with the first statement that
+		// changes a row, in one storage transaction with it; a statement that changes nothing takes the open
+		// back (a DDL is a commit point).
+		const run = () => sqlRun(db, m, params);
+		const { reply } = undoLog ? undoLog.statement(db, sqlStorage, m.sql, run) : run();
 		stats.ms += Date.now() - t;
 		stats.log.push('ok  ' + m.sql.slice(0, 160).replace(/\s+/g, ' '));
 		return reply;
@@ -2499,6 +2353,37 @@ function sqlStatement(db, m) {
 		stats.log.push('ERR ' + m.sql.slice(0, 160).replace(/\s+/g, ' ') + ' => ' + error.slice(0, 120));
 		return { ok: false, error };
 	}
+}
+// One statement and its reply; rowsWritten is what the storage counted, for the undo log's no-op check.
+function sqlRun(db, m, params) {
+	const returnsRows = /^\s*(SELECT|PRAGMA|WITH|VALUES|EXPLAIN)\b/i.test(m.sql) || /\bRETURNING\b/i.test(m.sql);
+	let reply;
+	let rowsWritten = 0;
+	if (returnsRows) {
+		const cur = db.exec(m.sql, ...params);
+		const rows = [...cur.raw()];
+		// Billed units (Durable Objects pricing): rows read and written.
+		stats.rowsRead += cur.rowsRead;
+		stats.rowsWritten += cur.rowsWritten;
+		rowsWritten = cur.rowsWritten;
+		if (undoLog) undoLog.afterStatement(db, m.sql, cur.rowsWritten);
+		let blob = false;
+		for (const row of rows) blob = sqlRow(row) || blob;
+		reply = { ok: true, columns: cur.columnNames || [], rows, changes: 0, last_row_id: 0, blob };
+	} else {
+		let changes = 0;
+		changes = sqlChanges(db, () => {
+			const cur = db.exec(m.sql, ...params);
+			cur.toArray();
+			stats.rowsRead += cur.rowsRead;
+			stats.rowsWritten += cur.rowsWritten;
+			rowsWritten = cur.rowsWritten;
+			if (undoLog) undoLog.afterStatement(db, m.sql, cur.rowsWritten);
+		});
+		const insert = changes > 0 && /^\s*(INSERT|REPLACE)\b/i.test(m.sql);
+		reply = { ok: true, columns: [], rows: [], changes, last_row_id: insert ? db.exec('SELECT last_insert_rowid()').raw().next().value[0] : 0 };
+	}
+	return { reply, rowsWritten };
 }
 
 // Move a site in or out (DB_IN_DO). The dump is JSON lines: {"sql"} for each
@@ -2618,6 +2503,13 @@ const SENT_HEADER = 'x-perf-sent';
 // Worker can reach the object, so the object can trust it.
 const ORIGIN_HEADER = 'x-wp-public-origin';
 export class PhpRuntime extends DurableObject {
+	// #352: an isolate that died with a frame or a transaction open is rolled back FIRST, before any request,
+	// alarm, /_dbexport or snapshot reads the database (blockConcurrencyWhile holds them all).
+	constructor(ctx, env) {
+		super(ctx, env);
+		ENV = env;
+		if (env.DB_IN_DO === 'on' && env.REAL_TRANSACTIONS !== 'off') ctx.blockConcurrencyWhile(async () => { txnRecover(ctx.storage.sql, ctx.storage); });
+	}
 	// Page cache purges for the whole site (issue #78). PHP runs in this one
 	// object (PHP_DO_POOL=1), so every change of content passes here. The
 	// Worker's PURGE_GAP_MS was per isolate: a burst of parallel writes reached
@@ -2738,7 +2630,7 @@ export class PhpRuntime extends DurableObject {
 					cronRunSink = null;
 					// A cron run that left a transaction open is rolled back, as a request is (MySQL rolls
 					// back on connection close); a throw is re-raised to the outer catch after this.
-					if (realTxn && txnFrames) txnEnd(sql, this.ctx.storage);
+					if (realTxn && undo().phpTxnOpen()) txnEnd(sql, this.ctx.storage);
 				}
 				// Send what runCron just enqueued (the deferred WC order mails). The request path drains
 				// pendingEmails at the end of a request; the alarm is the ONLY drain when no request
@@ -2826,6 +2718,15 @@ export class PhpRuntime extends DurableObject {
 		const env = this.env;
 		ENV = env;
 		const objectUrl = new URL(raw.url);
+		// #352: the outcome of a request's frame, for the front Worker's write-loss answer (never a client: the
+		// Worker answers a client's /_frame itself). It needs no public origin, so it is answered before the
+		// origin guard below (pf352f at ebb62f5: every probe got 500 "missing x-wp-public-origin").
+		if (objectUrl.pathname === '/_frame') {
+			const db = env.DB_IN_DO === 'on' ? this.ctx.storage.sql : null;
+			if (!db || env.REAL_TRANSACTIONS === 'off') return Response.json({ frame: null, reason: 'no undo log' });
+			txnRecover(db, this.ctx.storage);
+			return Response.json({ frame: undo(env).status(db, objectUrl.searchParams.get('id') || '') });
+		}
 		const origin = raw.headers.get(ORIGIN_HEADER);
 		// Without it, the object does not guess an origin: a wrong one redirects every page.
 		if (!origin) return new Response('missing ' + ORIGIN_HEADER, { status: 500 });
@@ -2969,6 +2870,8 @@ export class PhpRuntime extends DurableObject {
 			sqlStorage = sql ? this.ctx.storage : null;
 			const realTxn = sql && env.REAL_TRANSACTIONS !== 'off';
 			if (realTxn) txnRecover(sql, this.ctx.storage);
+			// #352: arm the request frame (REQUEST_FRAMES=on); it opens at the first write. The Worker sends the id.
+			if (realTxn) undo(env).arm(sql, req.headers.get('x-pf-req') || 'obj-' + Date.now() + '-' + Math.random().toString(36).slice(2, 8));
 			// One PHP run at a time (withPhp), so one slot holds this run's answer.
 			turnstileSlot.set(turnstileHeader);
 			try {
@@ -2983,8 +2886,8 @@ export class PhpRuntime extends DurableObject {
 				return res;
 			} finally {
 				turnstileSlot.clear();
-				// A request that threw also ends its transaction (rolled back).
-				if (realTxn && txnFrames) txnEnd(sql, this.ctx.storage);
+				// A request that threw also ends its transaction (rolled back), and keeps its frame. Idempotent.
+				if (realTxn) txnEnd(sql, this.ctx.storage);
 				phpPending--;
 				// Hold cron off briefly so an externally-armed alarm cannot run runCron in the
 				// /_install -> /_activate gap, where /_activate would reuse the cron runtime (#185).
@@ -3167,8 +3070,34 @@ async function preverifyTurnstile(req, env, url) {
 	return { route, value: encodeResult(res, token), res };
 }
 
+// #352: ask the object (a NEW isolate after a reset) what became of a request's frame. One subrequest, on
+// the write-loss path only. null when it cannot answer: then the client gets today's message.
+async function frameProbe(env, name, id) {
+	if (env.REQUEST_FRAMES !== 'on' || !id) return null;
+	try {
+		const stub = env.PHP_RUNTIME.get(env.PHP_RUNTIME.idFromName(name), env.PHP_LOCATION ? { locationHint: env.PHP_LOCATION } : undefined);
+		const r = await stub.fetch(new Request('https://php-object/_frame?id=' + encodeURIComponent(id)));
+		const text = await r.text();
+		let j = null;
+		try { j = JSON.parse(text); } catch {}
+		// The raw answer, so a null state is never a blind spot: status, the body keys, the frame or the reason.
+		console.log(JSON.stringify({ m: 'frame-probe-raw', status: r.status, keys: j && typeof j === 'object' ? Object.keys(j) : null, frame: j ? j.frame ?? null : null, reason: j ? j.reason ?? null : null, body: j ? undefined : text.slice(0, 120) }));
+		if (!r.ok) return null;
+		return (j && j.frame) || null;
+	} catch (e) {
+		console.log(JSON.stringify({ m: 'frame-probe-raw', error: String((e && e.message) || e).slice(0, 200) }));
+		return null;
+	}
+}
 async function toPhpObject(req, env, url, ctx) {
 	const name = phpObjectName(env, url);
+	// #352: /_frame is the Worker's own probe of the object. A client gets 404; a spike-token holder gets the
+	// frame of ?id= (the proof reads it; the request id is in the x-pf-req response header).
+	const frameSpikeOk = Boolean(env.SPIKE_TOKEN) && req.headers.get('x-spike-token') === env.SPIKE_TOKEN;
+	if (url.pathname === '/_frame' && frameSpikeOk) return Response.json({ frame: await frameProbe(env, name, url.searchParams.get('id') || '') }, { headers: { 'cache-control': 'no-store' } });
+	if (url.pathname === '/_frame') return new Response('Not Found', { status: 404 });
+	// #352: one id per client request (a retry keeps it), so the probe can ask for this request's frame.
+	const pfReq = env.REQUEST_FRAMES === 'on' ? crypto.randomUUID() : null;
 	// Turnstile (#351): verified here, before the object, so the object never waits on siteverify.
 	const pre = await preverifyTurnstile(req, env, url);
 	// The hint applies only when the object is made. D1's primary is in the
@@ -3185,6 +3114,8 @@ async function toPhpObject(req, env, url, ctx) {
 			fwd.headers.set(ORIGIN_HEADER, siteOrigin(env, url));
 			t0 = Date.now();
 			fwd.headers.set(SENT_HEADER, String(t0));
+			if (pfReq) fwd.headers.set('x-pf-req', pfReq);
+			else fwd.headers.delete('x-pf-req');
 			return stub.fetch(fwd);
 		},
 		req.method,
@@ -3211,8 +3142,12 @@ async function toPhpObject(req, env, url, ctx) {
 		// again" and never the dispatcher 502 (write-loss.mjs).
 		if (objectErrorOutcome(kind, req.method) === 'write-loss') {
 			console.log(JSON.stringify({ '@event': 'write-loss', m: 'write-loss', kind, method: req.method, path: url.pathname, failed: 'unknown', phase: 'request-killed' }));
-			const wl = writeLossResponse('unknown', wantsJson(url.pathname, url.search, req.headers.get('accept')), kind);
+			// #352: "nothing was saved" only when the object PROVES the frame rolled back.
+			const fr = await frameProbe(env, name, pfReq);
+			console.log(JSON.stringify({ m: 'frame-probe', phase: 'request-killed', state: fr ? fr.state : null, points: fr ? fr.points : null }));
+			const wl = frameProvesRollback(fr) ? rolledBackResponse(wantsJson(url.pathname, url.search, req.headers.get('accept')), kind, fr.undone) : writeLossResponse('unknown', wantsJson(url.pathname, url.search, req.headers.get('accept')), kind);
 			wl.headers['x-php-object'] = name;
+			if (pfReq) wl.headers['x-pf-req'] = pfReq; // the request id, for a spike-token /_frame read (#352)
 			return new Response(wl.body, { status: wl.status, headers: wl.headers });
 		}
 		const headers = objectErrorHeaders(kind, name, OVERLOAD_RETRY_AFTER_S);
@@ -3223,6 +3158,18 @@ async function toPhpObject(req, env, url, ctx) {
 		});
 	}
 	const r = res.r;
+	// #352: the object answered write-loss itself (its storage failed after a reset, PHP ran on): the frame
+	// was left open in storage; ask the new isolate whether it was rolled back.
+	if (pfReq && r.status === 500 && r.headers.get('x-write-loss') && r.headers.get('x-write-loss') !== 'rolled-back') {
+		const fr = await frameProbe(env, name, pfReq);
+		console.log(JSON.stringify({ m: 'frame-probe', phase: 'object-answered', state: fr ? fr.state : null, points: fr ? fr.points : null }));
+		if (frameProvesRollback(fr)) {
+			const rb = rolledBackResponse(wantsJson(url.pathname, url.search, req.headers.get('accept')), r.headers.get('x-isolate-reset') === 'storage' ? 'storage' : 'memory', fr.undone);
+			rb.headers['x-php-object'] = name;
+			if (pfReq) rb.headers['x-pf-req'] = pfReq;
+			return new Response(rb.body, { status: rb.status, headers: rb.headers });
+		}
+	}
 	const out = new Response(r.body, r);
 	out.headers.set('x-php-object', name);
 	// A Store API checkout refused because the verifier was unreachable: nothing was written, so
@@ -3643,6 +3590,7 @@ async function handle(req, env, url, spikeOk, maxBody, ctx) {
 			const booted = !bootPromise;
 			if (tracing()) fileTrace.begin({ cls: routeClass(req.method, url.pathname, url.search), method: req.method, path: url.pathname, boot: booted ? 1 : 0 });
 			const remote0 = remoteCounters();
+			const frame0 = undoLog ? undoLog.counts() : null; // #352: the frame counts, before this request
 			bootPromise ??= boot(origin);
 			const { php, handler, bootMs } = await bootPromise;
 			const bootWaitMs = Date.now() - tBoot;
@@ -3650,6 +3598,21 @@ async function handle(req, env, url, spikeOk, maxBody, ctx) {
 			const start = { dbTables: { ...stats.dbTables }, ocGroups: { ...stats.ocGroups }, calls: stats.calls, ms: stats.ms, fail: stats.failures.length, log: stats.log.length, rowsRead: stats.rowsRead, rowsWritten: stats.rowsWritten, inflates: stats.inflates, inflateBytes: stats.inflateBytes, reinflates: stats.reinflates, lazyWrites: stats.lazyWrites, rfN: stats.rfN, rfBytes: stats.rfBytes, rfMs: stats.rfMs, rfFail: stats.rfFail, rfCapped: stats.rfCapped, rsN: stats.rsN, rsBytes: stats.rsBytes, rsMs: stats.rsMs, rsFail: stats.rsFail, rsCapped: stats.rsCapped, rsRetry: stats.rsRetry, ocCalls: stats.ocCalls, ocHits: stats.ocHits, httpCalls: stats.httpCalls, txnOps: stats.txnOps, undoRows: stats.undoRows };
 			const delta = () => ({ calls: stats.calls - start.calls, ms: stats.ms - start.ms, failures: stats.failures.slice(start.fail), log: stats.log.slice(start.log) });
 			const t0 = Date.now();
+			// #352 the forced-reset proof (a MEASUREMENT that KILLS the isolate; spike token and HEADROOM_PROBE=on,
+			// the /_headroom kill probe's gate). plain: option A, then grow the PHP heap until the isolate resets,
+			// then option B: with REQUEST_FRAMES=on both must be gone after recovery. point: the same with a DDL
+			// (a commit point) after A: A must be KEPT. check: read A and B back (a later request, after recovery).
+			if (url.pathname === '/_frame-probe' && spikeOk && env.HEADROOM_PROBE === 'on') {
+				const mode = url.searchParams.get('mode') || 'plain';
+				const tag = String(url.searchParams.get('tag') || 'p').replace(/[^a-z0-9]/gi, '').slice(0, 16) || 'p';
+				if (mode === 'check') {
+					const r = await php.run({ code: `<?php require '/wordpress/wp-load.php'; echo json_encode(array('a' => get_option('pf352_${tag}_a', null), 'b' => get_option('pf352_${tag}_b', null)));` });
+					return new Response(r.text, { headers: { 'content-type': 'application/json', 'cache-control': 'no-store' } });
+				}
+				const point = mode === 'point' ? "$wpdb->query('CREATE TABLE IF NOT EXISTS pf352_probe_ddl (a INTEGER)');" : '';
+				const r = await php.run({ code: `<?php require '/wordpress/wp-load.php'; global $wpdb; update_option('pf352_${tag}_a', 'A', false); ${point} $keep = array(); for ($i = 0; $i < 64; $i++) { $keep[] = str_repeat('x', 8 << 20); } update_option('pf352_${tag}_b', 'B', false); echo 'survived';` });
+				return new Response(String(r.text).slice(0, 200), { headers: { 'cache-control': 'no-store' } });
+			}
 			if (url.pathname === '/_install') {
 				php.writeFile('/tmp/admin-password', req.headers.get('x-admin-password') || (env.SPIKE_TOKEN ? '' : 'local-spike-password'));
 				php.writeFile('/tmp/admin-email', req.headers.get('x-admin-email') || env.ADMIN_EMAIL || 'admin@example.com');
@@ -3806,6 +3769,9 @@ async function handle(req, env, url, spikeOk, maxBody, ctx) {
 					...(booted ? { l1: l1State } : {}), // #394 L1: where this boot's OPcache boot pack came from
 					...(booted && OPCACHE_REMOTE ? { remote: remoteState } : {}), // #563: the remote OPcache packs at this boot
 					...(booted && SITE_REMOTE ? { siteRemote: siteState } : {}), // #569: the remote site packs at this boot
+					// #352: this request's frame: opened (the first write armed it), commit points, misses, and the
+					// rows its PHP transactions undid. Only with REQUEST_FRAMES=on.
+					...(env.REQUEST_FRAMES === 'on' && undoLog && frame0 ? (() => { const c = undoLog.counts(); return { frame: { opened: c.opened - frame0.opened, kept: c.kept - frame0.kept, points: c.points - frame0.points, miss: c.miss - frame0.miss, noop: c.noop - frame0.noop, own: c.own - frame0.own, ownTotal: c.own, ...(c.opened > frame0.opened ? { by: undoLog.openedBy(), req: req.headers.get('x-pf-req') || null } : {}) } }; })() : {}),
 					// #569: site pack fetches this request (subrequests, the one retry included), KiB, ms,
 					// the failed ones (an honest 500 if PHP required the file), the retries, the opens past
 					// the hard cap, the distinct packs, and the held high-water (the hot pack not included).

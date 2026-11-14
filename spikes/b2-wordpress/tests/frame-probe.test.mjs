@@ -1,0 +1,83 @@
+// node --test spikes/b2-wordpress/tests/frame-probe.test.mjs (#352). The lead's ruling (iii): never claim
+// "nothing saved" without the /_frame probe's proof. Only a frame that is rolled-back with NO commit point
+// proves it; anything else (unknown, still open, kept, rolled back after a commit point) keeps today's
+// "some changes may have been saved" answer.
+import { test } from 'node:test';
+import assert from 'node:assert/strict';
+import { readFileSync } from 'node:fs';
+import { frameProvesRollback, rolledBackResponse, writeLossResponse, ROLLED_BACK_MESSAGE, WRITE_LOSS_MESSAGE } from '../write-loss.mjs';
+
+test('only rolled-back with 0 commit points proves nothing was kept', () => {
+	assert.equal(frameProvesRollback({ state: 'rolled-back', points: 0 }), true);
+	for (const f of [null, undefined, {}, { state: 'open', points: 0 }, { state: 'kept', points: 0 }, { state: 'rolled-back', points: 1 }, { state: 'rolled-back', points: '2' }]) {
+		assert.equal(frameProvesRollback(f), false, JSON.stringify(f));
+	}
+});
+
+test('the rolled-back answer is still a 500, says nothing was saved, and is never cached', () => {
+	const t = rolledBackResponse(false, 'memory', 7);
+	assert.equal(t.status, 500);
+	assert.equal(t.headers['x-write-loss'], 'rolled-back');
+	assert.equal(t.headers['x-write-undone'], '7');
+	assert.equal(t.headers['cache-control'], 'no-store');
+	assert.equal(t.body, ROLLED_BACK_MESSAGE + '\n');
+	const j = rolledBackResponse(true, 'storage');
+	assert.equal(j.headers['x-isolate-reset'], 'storage');
+	assert.deepEqual(JSON.parse(j.body).data, { status: 500, rolledBack: true });
+	assert.notEqual(ROLLED_BACK_MESSAGE, WRITE_LOSS_MESSAGE);
+	assert.equal(writeLossResponse(3).headers['x-write-loss'], '3', "today's answer is unchanged");
+});
+
+const src = readFileSync(new URL('../index.js', import.meta.url), 'utf8');
+test('index.js: both write-loss paths answer "rolled back" ONLY behind frameProvesRollback, and /_frame is refused to clients', () => {
+	const uses = [...src.matchAll(/rolledBackResponse\(/g)].length;
+	assert.equal(uses, 2, 'two answer sites: the killed request and the object-answered one');
+	assert.equal([...src.matchAll(/frameProvesRollback\(fr\) \? rolledBackResponse\(/g)].length + [...src.matchAll(/if \(frameProvesRollback\(fr\)\) \{\n\t\t\tconst rb = rolledBackResponse\(/g)].length, 2, 'each one gated on the proof');
+	assert.match(src, /if \(url\.pathname === '\/_frame'\) return new Response\('Not Found', \{ status: 404 \}\);/);
+});
+
+// The forced-reset proof route (#352, run on the lead's throwaway): it KILLS the isolate, so it must be
+// spike-gated AND allowed only with HEADROOM_PROBE=on (the same gate as the /_headroom kill probe).
+test('index.js: /_frame-probe is spike-gated and needs HEADROOM_PROBE=on; plain, point (a DDL) and check modes', () => {
+	assert.match(src, /if \(url\.pathname === '\/_frame-probe' && spikeOk && env\.HEADROOM_PROBE === 'on'\) \{/);
+	assert.match(src, /mode === 'point' \? "\$wpdb->query\('CREATE TABLE IF NOT EXISTS pf352_probe_ddl \(a INTEGER\)'\);" : ''/);
+	assert.match(src, /if \(mode === 'check'\)/);
+});
+
+// pf352f, 2026-11-14: the undo log was made in the PhpRuntime constructor before ENV was set, so frames
+// was false for the whole isolate (no frame armed, A kept after a reset). The decision must not depend on
+// which runs first.
+test('index.js: the undo log reads REQUEST_FRAMES when a request arms, not when the log is made', () => {
+	const src = readFileSync(new URL('../index.js', import.meta.url), 'utf8');
+	assert.match(src, /createUndoLog\(\{[^}]*frames:\s*\(\)\s*=>/, 'frames is a function');
+	const ctor = src.slice(src.indexOf('export class PhpRuntime'), src.indexOf('export class PhpRuntime') + 1200);
+	assert.match(ctor, /ENV = env;[\s\S]*txnRecover/, 'the constructor sets ENV before its recovery');
+});
+test('index.js: the Worker logs the /_frame probe raw result, and /_frame answers a spike-token holder', () => {
+	const src = readFileSync(new URL('../index.js', import.meta.url), 'utf8');
+	assert.match(src, /m: 'frame-probe-raw'/);
+	assert.match(src, /url\.pathname === '\/_frame' && frameSpikeOk/);
+	assert.match(src, /wl\.headers\['x-pf-req'\] = pfReq/, 'the write-loss answer names its request id');
+});
+
+// pf352f at ebb62f5, 2026-11-14 18:08Z: recovery rolled the frame back (frame-recover active 1, undone 1),
+// but every /_frame call answered 500 "missing x-wp-public-origin": the object's fetch refuses a request
+// with no public origin BEFORE it routes, and the Worker's probe sends none. /_frame needs no origin.
+test('index.js: the object answers /_frame BEFORE its public-origin guard (the probe carries no origin)', () => {
+	const src = readFileSync(new URL('../index.js', import.meta.url), 'utf8');
+	const f = src.indexOf('async fetch(raw) {');
+	assert.ok(f > 0);
+	const body = src.slice(f, f + 20000);
+	const frame = body.indexOf("objectUrl.pathname === '/_frame'");
+	const guard = body.indexOf("'missing ' + ORIGIN_HEADER");
+	assert.ok(frame > 0, 'the object routes /_frame on its own URL');
+	assert.ok(guard > 0);
+	assert.ok(frame < guard, '/_frame is answered before the origin guard');
+});
+
+// The frame's close runs after x-perf is built (txnEnd follows handle()), so frame.own is the OPEN side
+// only. frame.ownTotal is the isolate's running count: the next request's value includes this close.
+test('index.js: x-perf frame carries the running ownTotal, so the close side can be measured', () => {
+	const src = readFileSync(new URL('../index.js', import.meta.url), 'utf8');
+	assert.match(src, /own: c\.own - frame0\.own, ownTotal: c\.own,/);
+});

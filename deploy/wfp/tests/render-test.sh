@@ -202,5 +202,11 @@ ok "SITE_HOLD_KIB without SITE_REMOTE=1 fails the render" "$(SITE_HOLD_KIB=8192 
 for bad in "REMOTE_FETCH_CAP=1001" "REMOTE_FETCH_CAP=-1" "REMOTE_FETCH_CAP=6e1" "REMOTE_HOLD_KIB=65537" "SITE_FETCH_CAP=x" "SITE_HOLD_KIB=1.5" "SITE_RETRY_MS=5001"; do
   ok "$bad fails the render" "$(env "$bad" OPCACHE_REMOTE=1 SITE_REMOTE=1 OPCACHE_SPLIT=0 bash -c ". '$LIB'; render_user one https://wp-one.sub.workers.dev" >/dev/null 2>&1 && echo 0 || echo 1)"
 done
+# REQUEST_FRAMES (#352): on, off, or unset (no var).
+rqf() { "$PY" -c 'import json, sys, tomllib; print(json.dumps(tomllib.loads(sys.stdin.read())["vars"].get("REQUEST_FRAMES")))'; }
+ok "no REQUEST_FRAMES var by default" "$(env -u REQUEST_FRAMES bash -c ". '$LIB'; render_user one https://wp-one.sub.workers.dev" | rqf | grep -qx 'null' && echo 1 || echo 0)"
+ok "REQUEST_FRAMES=on renders it" "$(REQUEST_FRAMES=on render_user one https://wp-one.sub.workers.dev | rqf | grep -qx '"on"' && echo 1 || echo 0)"
+ok "REQUEST_FRAMES=off renders it" "$(REQUEST_FRAMES=off render_user one https://wp-one.sub.workers.dev | rqf | grep -qx '"off"' && echo 1 || echo 0)"
+for bad in yes 1 ON; do ok "REQUEST_FRAMES=$bad fails the render" "$(REQUEST_FRAMES=$bad render_user one https://wp-one.sub.workers.dev >/dev/null 2>&1 && echo 0 || echo 1)"; done
 echo "$fails failing check(s)"
 exit $fails
