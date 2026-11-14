@@ -43,3 +43,19 @@ test('index.js: /_frame-probe is spike-gated and needs HEADROOM_PROBE=on; plain,
 	assert.match(src, /mode === 'point' \? "\$wpdb->query\('CREATE TABLE IF NOT EXISTS pf352_probe_ddl \(a INTEGER\)'\);" : ''/);
 	assert.match(src, /if \(mode === 'check'\)/);
 });
+
+// pf352f, 2026-11-14: the undo log was made in the PhpRuntime constructor before ENV was set, so frames
+// was false for the whole isolate (no frame armed, A kept after a reset). The decision must not depend on
+// which runs first.
+test('index.js: the undo log reads REQUEST_FRAMES when a request arms, not when the log is made', () => {
+	const src = readFileSync(new URL('../index.js', import.meta.url), 'utf8');
+	assert.match(src, /createUndoLog\(\{[^}]*frames:\s*\(\)\s*=>/, 'frames is a function');
+	const ctor = src.slice(src.indexOf('export class PhpRuntime'), src.indexOf('export class PhpRuntime') + 1200);
+	assert.match(ctor, /ENV = env;[\s\S]*txnRecover/, 'the constructor sets ENV before its recovery');
+});
+test('index.js: the Worker logs the /_frame probe raw result, and /_frame answers a spike-token holder', () => {
+	const src = readFileSync(new URL('../index.js', import.meta.url), 'utf8');
+	assert.match(src, /m: 'frame-probe-raw'/);
+	assert.match(src, /url\.pathname === '\/_frame' && frameSpikeOk/);
+	assert.match(src, /wl\.headers\['x-pf-req'\] = pfReq/, 'the write-loss answer names its request id');
+});

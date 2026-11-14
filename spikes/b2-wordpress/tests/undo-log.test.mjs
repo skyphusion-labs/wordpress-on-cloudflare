@@ -383,3 +383,49 @@ test('a PRAGMA setter while armed opens no frame and still TAKES EFFECT (it neve
 	assert.equal(frameRows(db), 0);
 	assert.equal(u.counts().opened, 0);
 });
+
+// pf352f, 2026-11-14: the deployed object never armed a frame. index.js created the one undo log per
+// isolate at its FIRST use, and in a deployed object that is the PhpRuntime constructor's recovery, before
+// any fetch has set ENV: frames was decided false for the whole isolate. Local workerd hid it (the Worker's
+// fetch shares the isolate and sets ENV first). frames may be a function, asked when it matters.
+test('frames as a FUNCTION is asked at arm time, not at creation (the undo log may be made before env is known)', () => {
+	const { db, storage } = site();
+	let on = false;
+	const stats = { txnOps: 0, undoRows: 0 };
+	const u = createUndoLog({ stats, frames: () => on });
+	assert.equal(u.recover(db, storage), null, 'recovery first, as in the constructor, with frames still unknown');
+	u.arm(db, 'f0');
+	run(u, db, "INSERT INTO t (v) VALUES ('OFF')");
+	assert.equal(u.frameOpen(), false, 'the function says off: no frame (a function is not truthy-on)');
+	u.end(db);
+	db.exec("DELETE FROM t WHERE v = 'OFF'");
+	on = true;
+	u.arm(db, 'f1');
+	run(u, db, "INSERT INTO t (v) VALUES ('A')");
+	assert.equal(u.frameOpen(), true, 'the frame opens: frames was read when the request armed');
+	const b = createUndoLog({ stats, frames: () => true });
+	b.recover(db, storage);
+	assert.deepEqual(ids(db), ['seed']);
+	assert.equal(b.status(db, 'f1').state, 'rolled-back');
+});
+
+test('recovery ALWAYS logs one line, also when nothing was open (a blind spot otherwise)', () => {
+	const { db, storage } = site();
+	const logs = [];
+	const u = createUndoLog({ stats: { txnOps: 0, undoRows: 0 }, log: (o) => logs.push(o), frames: true });
+	u.recover(db, storage);
+	assert.equal(logs.filter((l) => l.m === 'frame-recover').length, 1, JSON.stringify(logs));
+	assert.equal(logs[0].active, 0);
+	assert.equal(logs[0].frames, true);
+});
+
+test('a frame open logs one line once it is COMMITTED (never for a no-op that took the open back)', () => {
+	const { db } = site();
+	const logs = [];
+	const u = createUndoLog({ stats: { txnOps: 0, undoRows: 0 }, log: (o) => logs.push(o), frames: true });
+	u.arm(db, 'f3');
+	run(u, db, "UPDATE t SET v = 'x' WHERE v = 'none'");
+	assert.equal(logs.filter((l) => l.m === 'frame-open').length, 0);
+	run(u, db, "INSERT INTO t (v) VALUES ('A')");
+	assert.deepEqual(logs.filter((l) => l.m === 'frame-open').map((l) => [l.req, l.by]), [['f3', 'INSERT t']]);
+});
