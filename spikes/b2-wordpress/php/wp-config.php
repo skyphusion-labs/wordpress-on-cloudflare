@@ -69,6 +69,13 @@ if ( ! defined( 'WP_DEBUG' ) ) {
 define( 'WP_DEBUG_DISPLAY', WP_DEBUG );
 define( 'DISABLE_WP_CRON', true );
 define( 'AUTOMATIC_UPDATER_DISABLED', true );
+// Issue #578. wp-admin loads each core script as its own static file, not through
+// load-scripts.php and load-styles.php. PHP's files hold no core .js (build.sh): the static
+// copies are served by Workers static assets. load-scripts.php reads each script from PHP's
+// files, so it answered one newline per script, and wp-admin had no jQuery. A static file needs
+// no PHP request. Core turns concatenation off on every public page already, and with
+// SCRIPT_DEBUG.
+define( 'CONCATENATE_SCRIPTS', false );
 // Outbound HTTP goes through the Worker (wp-content/mu-plugins/http-bridge.php,
 // issue #26). With HTTP_BRIDGE=off the Worker defines WP_HTTP_BLOCK_EXTERNAL in
 // wp-runtime.php instead, as before: PHP has no sockets, so a request fails fast.
