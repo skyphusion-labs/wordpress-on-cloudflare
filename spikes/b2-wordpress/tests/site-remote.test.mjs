@@ -176,5 +176,12 @@ test('the PIN with the inflate arena on: the same, exactly', async () => {
 
 test('the guard can fail: with the pin OFF the same read does NOT give the whole file', async () => {
 	const s = await site({ pin: false });
-	assert.notEqual(await s.run(HALF_OPEN), WANT);
+	const out = await s.run(HALF_OPEN);
+	assert.notEqual(out, WANT);
+	// The failure is the one the pin prevents: a read in the MIDDLE of an open file fails with EIO
+	// (measured: "stream_get_contents(): Read of 8192 bytes failed with errno=29 I/O error"), and PHP
+	// goes on with a SHORT file. Not some other error.
+	assert.match(out, /Read of \d+ bytes failed with errno=29/);
+	const got = Number(out.replace(/<[^>]*>/g, '').trim().split('\n').pop().split('|')[0]);
+	assert.ok(Number.isFinite(got) && got > 0 && got < BIG.length, 'a short read: ' + got);
 });
