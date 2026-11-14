@@ -84,7 +84,14 @@ export function createRemotePacks({ index, fetchPack, parse, stats, cap = REMOTE
 	let hot = null; // the hot pack's Map(name -> entry), held for the life of this runtime
 	const distinct = new Set(); // packs fetched in this request: N minus this is the refetch (thrash) count
 	let lastDistinct = 0;
-	const pending = new Map(); // packNo -> promise of the fetch in flight
+	const pending = new Map(); // packNo -> promise of the fetch in flight, THIS request only
+	// #569 audit (the #568 class): every fetch is started by an open() of a live request and awaited
+	// by it, through the loader's Suspending import; nothing here runs in the background, so nothing
+	// needs waitUntil. But a request can END with a fetch in flight (an exception, a dropped isolate
+	// task), and workerd may drop that promise so it never settles. epoch makes such a fetch harmless:
+	// endRequest() forgets it (the next request fetches again, never waits on it), and a late result
+	// of an ended request is thrown away, never held in the next one.
+	let epoch = 0;
 	const failed = new Set(); // packNo that failed in this request
 	const own = !budget;
 	const bud = budget || createFetchBudget({ soft: cap, hard: cap });
@@ -139,6 +146,7 @@ export function createRemotePacks({ index, fetchPack, parse, stats, cap = REMOTE
 		stats[K('N')]++;
 		distinct.add(packNo);
 		const t = Date.now();
+		const mine = epoch;
 		const p = (async () => {
 			let bytes;
 			for (let attempt = 0; ; attempt++) {
@@ -154,6 +162,7 @@ export function createRemotePacks({ index, fetchPack, parse, stats, cap = REMOTE
 					stats[K('N')]++;
 				}
 			}
+			if (mine !== epoch) throw new Error(pk.name + ': its request ended before the fetch did');
 			const m = new Map();
 			for (const e of parse(bytes)) m.set(e.name, e);
 			hold(packNo, m, bytes.length);
@@ -161,10 +170,11 @@ export function createRemotePacks({ index, fetchPack, parse, stats, cap = REMOTE
 		})().then(
 			() => {
 				stats[K('Ms')] += Date.now() - t;
-				pending.delete(packNo);
+				if (mine === epoch) pending.delete(packNo);
 			},
 			(e) => {
 				stats[K('Ms')] += Date.now() - t;
+				if (mine !== epoch) throw e; // an ended request's fetch: no count, no mark on the next request
 				stats[K('Fail')]++;
 				failed.add(packNo);
 				pending.delete(packNo);
@@ -191,6 +201,8 @@ export function createRemotePacks({ index, fetchPack, parse, stats, cap = REMOTE
 			return e ? e.data(out) : null;
 		},
 		endRequest() {
+			epoch++;
+			pending.clear();
 			held.clear();
 			heldBytes = 0;
 			lastHeldMax = heldMax;
