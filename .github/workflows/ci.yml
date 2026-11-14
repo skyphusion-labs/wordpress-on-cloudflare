@@ -72,6 +72,8 @@ jobs:
         run: php tests/a/found-rows-test.php
       - name: approach A object-cache KV writes are coalesced and 429s counted (issue #500)
         run: node --test spikes/b2-wordpress/tests/oc-l2-writer.test.mjs
+      - name: b-dosql the request frame answers "nothing saved" only on the /_frame proof (issue #352)
+        run: node --test spikes/b2-wordpress/tests/frame-probe.test.mjs
       - name: b-dosql approach-A options never persist across isolates (issue #491)
         run: php spikes/b2-wordpress/tests/object-cache-491-test.php
       - name: Approach A object cache source invariants (issue #218)
@@ -418,6 +420,11 @@ jobs:
         # gives @file_get_contents "", so our PHP and JS must never read a site .php themselves.
         working-directory: spikes/b2-wordpress
         run: node --test tests/phpwasm-exports.test.mjs tests/our-file-reads.test.mjs
+      - name: The undo log and the request frame on node:sqlite, #60's first CI coverage (issue #352)
+        # A new isolate is a new createUndoLog on the same database: lazy open, rollback by recovery, PHP
+        # savepoints, commit points, the miss guard, deferred L2 work, row-id reuse, and frames off = #60.
+        working-directory: spikes/b2-wordpress
+        run: node --test tests/undo-log.test.mjs
   coverage:
     runs-on: ubuntu-latest
     steps:

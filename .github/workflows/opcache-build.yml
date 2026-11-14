@@ -47,6 +47,14 @@ jobs:
             tail -40 build/opcache.log; echo '--- dev.log'; tail -40 dev.log 2>/dev/null || true
             exit 1
           fi
+      - name: The request frame off and on, end to end on workerd, with its cost measured (issue #352)
+        # On the primed bundled build (before the remote steps, which empty the zips): e2e.sh and woo.py
+        # both ways, then 10 saves, 10 post-new GETs and 10 public GETs read for dbMs, rows and frame.
+        working-directory: spikes/b2-wordpress
+        run: |
+          if ! tests/frames-e2e.sh; then
+            echo "::error::frames-e2e.sh failed; last lines of dev.log:"; tail -40 dev.log 2>/dev/null || true; exit 1
+          fi
       - name: ALL OPcache files as remote packs, end to end on workerd (issue #563, OPCACHE_REMOTE, no split)
         # On the primed build above: the trace, opcache-remote.py, then tests/remote-e2e.sh runs the
         # pages, the admin and the store three ways (remote packs, cap 0, off). Each must work.

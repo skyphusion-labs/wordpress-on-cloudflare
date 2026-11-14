@@ -44,7 +44,7 @@ RECORD = "_build/settings.json"
 SETTINGS = ("PHP_INI", "LAZY_CACHE_MB", "LAZY_ARENA", "LAZY_ARENA_MB", "PHP_RECYCLE", "CRON_INTERVAL_MS",
             "TURNSTILE_SITEKEY", "TURNSTILE_WOO", "TURNSTILE_LOGIN", "TURNSTILE_COMMENTS",
             "MAIL_FROM", "MAIL_FROM_NAME", "PHP_LOCATION", "WP_VECTORIZE_SEARCH", "OPCACHE_SPLIT", "OPCACHE_REMOTE", "SITE_REMOTE",
-            "REMOTE_FETCH_CAP", "REMOTE_HOLD_KIB", "SITE_FETCH_CAP", "SITE_HOLD_KIB", "SITE_RETRY_MS")
+            "REMOTE_FETCH_CAP", "REMOTE_HOLD_KIB", "SITE_FETCH_CAP", "SITE_HOLD_KIB", "SITE_RETRY_MS", "REQUEST_FRAMES")
 # Measurement flags: never recorded, never kept, by design (the lead's ruling on #561). Silent
 # persistence is the dangerous direction for them; silently going off is the safe one. A run that
 # exports one turns it on for that upload; the next update without it turns it OFF, and says so.
@@ -63,7 +63,7 @@ SECRETS = ("TURNSTILE_SECRET",)
 DROPPABLE_VARS = ("PHP_INI", "LAZY_CACHE_MB", "LAZY_ARENA", "LAZY_ARENA_MB", "PHP_RECYCLE", "CRON_INTERVAL_MS",
                   "TURNSTILE_SITEKEY", "TURNSTILE_WOO", "TURNSTILE_LOGIN", "TURNSTILE_COMMENTS",
                   "MAIL_FROM_NAME", "OPCACHE_REMOTE", "SITE_REMOTE",
-                  "REMOTE_FETCH_CAP", "REMOTE_HOLD_KIB", "SITE_FETCH_CAP", "SITE_HOLD_KIB", "SITE_RETRY_MS")  # each renders its var only when on (#563, #569)
+                  "REMOTE_FETCH_CAP", "REMOTE_HOLD_KIB", "SITE_FETCH_CAP", "SITE_HOLD_KIB", "SITE_RETRY_MS", "REQUEST_FRAMES")  # each renders its var only when on (#563, #569)
 
 
 def drop_list(env=os.environ):
