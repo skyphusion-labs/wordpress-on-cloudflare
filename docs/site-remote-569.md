@@ -44,9 +44,10 @@ leaves the bundle too.
 ## Never a half file
 
 - **A pack is used only if** its length and SHA-256 match.
-- **A remote site file is PINNED while an fd is open** (`attachLazyContents` `tag.pin`). The open
-  inflates it at once, while `open()` holds its pack. No evict drops an open file's bytes, and a
-  pinned file never lives in the inflate arena.
+- **A remote site file is PINNED from its fetch to its close** (`attachLazyContents` `tag.pin`:
+  `'open'` for a non-`.php`, which is pinned by the open; `'read'` for a `.php`, pinned by the read
+  hook through `node.pagefeatherPin`). The pin inflates it at once, while its pack is held. No evict
+  drops a pinned file's bytes, and a pinned file never lives in the inflate arena.
   - So after a successful `open()` every read succeeds; the only failure point is `open()`.
   - Measured without the pin: `stream_get_contents(): Read of 8192 bytes failed with errno=29 I/O
     error`, and a short file. With the pin, every byte, the arena on too (`tests/site-remote.test.mjs`).
@@ -55,8 +56,9 @@ leaves the bundle too.
 
 ## Failure is an honest 500, so: one retry, and the hard cap
 
-- **A site file that cannot be fetched fails its `open()` with EIO.** `include` returns false;
-  `require` is a fatal error and a 500.
+- **A site file that cannot be fetched fails with EIO.** A non-`.php` fails its `open()`, so
+  `file_get_contents` returns false. A `.php` fails its first read, with no byte delivered: `include`
+  returns false, and `require` is a fatal error and a 500.
 - **One retry:** a failed site-pack fetch (non-200, length, SHA-256) is tried again ONCE in the same
   request, after `SITE_RETRY_MS` (50). Then it fails. The retry is counted (`rsRetry`), and it takes
   budget like any fetch.
@@ -66,14 +68,28 @@ leaves the bundle too.
 - **Measured** (simulated, then scaled for the measured undercount): a cold admin request is about 44
   fetches in all, OPcache about 42 and site 2. **This was measured on the PRIMING store** (e2e.sh
   and tests/woo.py data) in CI, not the 2,609-product sample store; the proof re-measures it there.
-- **OPEN, found by the site e2e on workerd (opcache-build run 43608158287):** the hook fetches on
-  OPEN, but the trace counted READS. PHP opens site files it never reads; OPcache opens a source
-  to resolve it even when the script comes from its cache.
-  - So a cold boot made 88 site fetches over 14 distinct packs, where the trace predicted 1, and
-    tests/woo.py's checkout passed the hard cap of 96 (`{"m":"remote","kind":"rs","capped":96}`),
-    a 500.
-  - The design needs the lead's decision before this ships: fetch on the first READ instead of the
-    open. See the PR.
+
+## The hybrid: a .php at its first READ, every other file at its OPEN
+
+- **The first build** fetched every site file at OPEN. On workerd (opcache-build run 43608158287) a
+  cold boot made 88 site fetches over 14 packs, and tests/woo.py's checkout passed the hard cap of
+  96, a 500.
+- **The cause** (step 3, re-measured with opens and reads apart, #394 issuecomment-6879862441):
+  OPcache opens a `.php` source it then serves from its cache without reading it.
+  - Over 55 traced requests there were 42,056 opens, 4,335 reads and 37,721 opened-never-read files.
+  - **All 37,721 were `.php`; 0 were other files.**
+- **The rule**, proven on production workerd in Gate 0b (#394 issuecomment-6879785529, 9 of 9 cases x3):
+  - **a `.php` is fetched at its FIRST READ** (`prepare.sh` PY6: `js_fd_read`, already Suspending
+    in the stock pattern, plus `fd_read` and `_mmap_js`; this wasm has no `fd_pread`), and pinned
+    from that read to its close;
+  - **every other site file is fetched at its OPEN** (PY5), and pinned from the open.
+- **Why not a read for everything:** a failed READ makes `@file_get_contents` return `""` (Gate 0b), not
+  `false`. A failed OPEN keeps `false`. Non-`.php` files that are opened are always read (step 3), so
+  fetching them at open costs nothing.
+- **Measured fetch cost** (simulated): 2 site fetches per cold admin request, 0 or 1 warm. Hot set:
+  46 files, 30.1 KiB.
+- **Open with no read costs 0 fetches**, and the OPcache source-resolve path fetches the source 0 times
+  (Gate 0b: 1 with the open hook).
 
 ## `file_exists` storms only stat
 
@@ -83,6 +99,19 @@ leaves the bundle too.
 - The hook is only in `__syscall_openat`. Opening a directory, or a file the index does not hold, is
   no fetch.
 - Tested: 40,000 stat-family calls plus `scandir` make 0 fetches.
+
+## Guards
+
+- **The boot self-check.** Gate 0b's red control read files as EMPTY, with no error. So a SITE_REMOTE
+  boot reads one known remote `.php` through PHP: `site-remote.py` records `selfcheck` as [the
+  smallest hot `.php`, its size, its SHA-256]. Anything else fails the boot, loudly (`siteRemote`
+  `fail:selfcheck`).
+- **The export guard** (`tests/phpwasm-exports.test.mjs`). A read inside an export outside the
+  loader's `exportPattern` throws `SuspendError` (Gate 0b). php-wasm calls 3 promising exports and
+  12 setters today; a bump that calls any other export goes red.
+- **Our own reads** (`tests/our-file-reads.test.mjs`). Every direct file read in our mu-plugins and in
+  index.js is listed with why it never reads a remote site `.php`, where `""` would mean a failed read.
+  A new one goes red until it is reviewed. A JS-side read of an unfetched remote file throws.
 
 ## The instrument: `x-perf`
 
@@ -101,9 +130,18 @@ leaves the bundle too.
 
 ## Tests
 
-- **`tests/site-remote.test.mjs`** (Node 24, the real loader, PHP and `attachLazyContents`): require,
-  include and file_get_contents; one retry; two failures; the stat storm; the pin, with and without
-  the arena; and the no-pin control.
+- **`tests/site-remote.test.mjs`** (Node 24, the real loader with PY5 and PY6, PHP, `attachLazyContents`
+  and `createSiteHooks`):
+  - the hybrid;
+  - open with no read is 0 fetches;
+  - the OPcache source-resolve path is 0 fetches;
+  - one retry for each kind;
+  - a failed `.php` (include false, require fatal) and a failed data file (false, never `""`);
+  - the pin for both kinds, with the arena on too;
+  - the no-pin control, built by REMOVING the pin count from the real code;
+  - the read control;
+  - a JS-side read throws;
+  - the boot self-check both ways.
 - **`tests/remote-packs.test.mjs`:** the shared soft/hard budget, the retry, a retry that needs
   budget, the hot pack outside the LRU, and the `rs` prefix.
 - **`tests/site-remote-pack-test.py`:** the hot pack, cold-boot order, an empty `site.zip`, the

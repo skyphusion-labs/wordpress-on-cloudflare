@@ -50,7 +50,7 @@ import OPCACHE_REMOTE from './build/opcache-remote-index.js';
 // null on a default build. There is NO runtime off switch: the bytes are not in the bundle, so the
 // rollback is a deploy without SITE_REMOTE.
 import SITE_REMOTE from './build/site-remote-index.js';
-import { createRemotePacks, createFetchBudget, REMOTE_FETCH_CAP, REMOTE_HOLD_BYTES, SITE_FETCH_CAP, SITE_HOLD_BYTES } from './remote-packs.mjs';
+import { createRemotePacks, createFetchBudget, createSiteHooks, selfCheckCode, checkSelfCheck, REMOTE_FETCH_CAP, REMOTE_HOLD_BYTES, SITE_FETCH_CAP, SITE_HOLD_BYTES } from './remote-packs.mjs';
 // The build id baked at build time (build.sh writes build/build-id.js), so the
 // object can report which code version it runs (issue #35 slice 5).
 import BUILD_ID from './build/build-id.js';
@@ -490,6 +490,7 @@ let remotePacks = null;
 // #569: the site packs of the runtime booted last, the request budget both share (the soft cap for
 // OPcache opens, the hard cap for site opens), and the site state for x-perf (siteRemote).
 let sitePacks = null;
+let siteHooks = null; // #569: the hybrid hooks (createSiteHooks): .php at read, others at open
 let fetchBudget = null;
 let siteState = 'none';
 let remoteState = 'none';
@@ -498,9 +499,15 @@ const remoteOn = () => Boolean(OPCACHE_REMOTE && ENV && ENV.OPCACHE_REMOTE !== '
 // pack; if it rejects, the open fails with EIO and OPcache compiles the script from source.
 function remoteOpenHook(path) {
 	if (path.length > OPCACHE_DIR.length + 1 && path.startsWith(OPCACHE_DIR + '/')) return remotePacks ? remotePacks.open(path.slice(OPCACHE_DIR.length + 1)) : null;
-	// #569: a site file (site.zip names have no leading slash). A directory or a file the index does
-	// not hold (one PHP wrote) is no fetch.
-	return sitePacks && path.charCodeAt(0) === 47 ? sitePacks.open(path.slice(1)) : null;
+	// #569: a site file (site.zip names have no leading slash). The hybrid: only a NON-.php is fetched at
+	// open (a .php at its first read, remoteReadHook). A directory or a file the index does not hold
+	// (one PHP wrote) is no fetch.
+	return siteHooks ? siteHooks.open(path) : null;
+}
+// #569: the loader's reads ask this first (prepare.sh PY6). A remote .php whose pack is not held yet
+// returns a promise: PHP waits, then reads; a rejection fails the read with EIO before any byte.
+function remoteReadHook(stream, kind) {
+	return siteHooks ? siteHooks.read(stream, kind) : null;
 }
 async function fetchRemotePack(name) {
 	const r = await ENV.ASSETS.fetch(new Request('https://assets.local/_pf/' + (OPCACHE_REMOTE || SITE_REMOTE).id + '/' + name));
@@ -517,7 +524,7 @@ function remoteSiteFile(FS, path, name, size) {
 		const b = sitePacks && sitePacks.data(name, out);
 		if (!b) throw new FS.ErrnoError(29);
 		return b;
-	}, { src: 'site', path, pin: true });
+	}, { src: 'site', path, pin: siteHooks.pinMode(name) });
 }
 function remoteFile(FS, path, name, size) {
 	FS.writeFile(path, new Uint8Array(0));
@@ -598,11 +605,13 @@ function attachLazyContents(node, size, dataFn, tag) {
 	let written = false;
 	let used = size;
 	let inflations = 0; // #394: a second inflate of this file is a RE-inflate (its copy was evicted)
-	// #569: tag.pin (a REMOTE site file). Its bytes come from a pack that may be evicted, so while an
-	// fd is open the inflated copy is pinned: no evict drops it, and it never lives in the arena (a
-	// later alloc could reuse that memory). The open inflates it at once, while open() holds the pack.
-	// After a successful open every read succeeds; the only failure point is open(): never a half file.
-	const pin = Boolean(tag && tag.pin);
+	// #569: tag.pin (a REMOTE site file). Its bytes come from a pack that may be evicted, so from the
+	// point its pack was fetched until its close, the inflated copy is PINNED: no evict drops it, and it
+	// never lives in the arena (a later alloc could reuse that memory). Two modes (the hybrid):
+	// - 'open' (non-.php): fetched at open(), pinned and inflated by the open;
+	// - 'read' (.php): fetched at the FIRST READ (prepare.sh PY6), pinned there by pagefeatherPin.
+	// After the pin, every read succeeds; the only failure point is the fetch: never a half file.
+	const pin = tag && tag.pin ? (tag.pin === 'read' ? 'read' : 'open') : null;
 	let pins = 0;
 	const drop = () => {
 		if (!written && pins === 0) contents = null;
@@ -666,19 +675,33 @@ function attachLazyContents(node, size, dataFn, tag) {
 	const base2 = node.stream_ops;
 	if (pin && base2) {
 		// #569: FS.open copies node.stream_ops into the stream and calls its open, FS.close its close.
-		const pinned = Object.create(base2);
-		pinned.open = function (stream) {
+		const pinStream = (stream) => {
 			pins++;
+			stream.pfPinned = true;
 			try {
-				void node.contents; // inflate now, from the pack open() made sure is held
+				void node.contents; // inflate now, from the pack the fetch made sure is held
 			} catch (e) {
 				pins--;
+				stream.pfPinned = false;
 				throw e;
 			}
-			if (typeof base2.open === 'function') base2.open(stream);
 		};
+		const pinned = Object.create(base2);
+		if (pin === 'open') {
+			pinned.open = function (stream) {
+				pinStream(stream);
+				if (typeof base2.open === 'function') base2.open(stream);
+			};
+		} else {
+			// The read hook (remote-packs.mjs createSiteHooks) pins at the first read.
+			node.pagefeatherName = tag.path.slice(1);
+			node.pagefeatherPin = pinStream;
+		}
 		pinned.close = function (stream) {
-			if (pins > 0) pins--;
+			if (stream.pfPinned) {
+				stream.pfPinned = false;
+				if (pins > 0) pins--;
+			}
 			if (typeof base2.close === 'function') base2.close(stream);
 		};
 		node.stream_ops = pinned;
@@ -1412,6 +1435,8 @@ async function boot(origin) {
 		websocket: { decorator: refuseSocketsDecorator((info) => console.log(JSON.stringify({ m: 'socket', refused: info }))) },
 		// #563: only on an OPCACHE_REMOTE build. Without it the loader does not wrap open() at all.
 		...(remoteOn() || SITE_REMOTE ? { pagefeatherOpen: remoteOpenHook } : {}),
+		// #569: only on a SITE_REMOTE build. Without it no read path is wrapped at all.
+		...(SITE_REMOTE ? { pagefeatherRead: remoteReadHook } : {}),
 	});
 	const php = new PHP(id);
 	lastBootedPhp = php;
@@ -1496,10 +1521,12 @@ async function boot(origin) {
 			throw new Error('SITE_REMOTE build without an ASSETS binding');
 		}
 		const siteHold = intEnv(ENV.SITE_HOLD_KIB, 0, 65536, SITE_HOLD_BYTES / 1024) * 1024;
+		siteHooks = null;
 		sitePacks = createRemotePacks({
 			index: SITE_REMOTE, fetchPack: fetchRemotePack, parse: zipEntries, stats, prefix: 'rs', budget: fetchBudget, limit: 'hard',
 			holdBytes: siteHold, retries: 1, retryDelayMs: intEnv(ENV.SITE_RETRY_MS, 0, 5000, 50), log: (o) => console.error(JSON.stringify(o)),
 		});
+		siteHooks = createSiteHooks(sitePacks);
 		for (const d of SITE_REMOTE.dirs) mkdirp('/' + d);
 		for (const [name, [, size]] of Object.entries(SITE_REMOTE.files)) {
 			const full = '/' + name;
@@ -1694,6 +1721,22 @@ async function boot(origin) {
 	// the AI binding does for alt text.
 	if (analyticsEnabled(ENV)) lines.push(`define('SKYPHUSION_ANALYTICS', true);`);
 	php.writeFile(DOCROOT + '/wp-runtime.php', lines.join('\n') + '\n');
+
+	// #569: the BOOT SELF-CHECK. Gate 0b's red control read files as EMPTY, with no error: a SITE_REMOTE
+	// build whose read path is broken would serve empty PHP. A known remote .php is read through PHP
+	// here and must match its recorded size and SHA-256, or the boot fails, loudly.
+	if (SITE_REMOTE) {
+		try {
+			if (!SITE_REMOTE.selfcheck) throw new Error('site self-check failed: the site index has no selfcheck entry (an old site-remote.py?)');
+			const r = await php.run({ code: selfCheckCode(SITE_REMOTE.selfcheck) });
+			checkSelfCheck(r.text, SITE_REMOTE.selfcheck);
+			siteState += ' selfcheck ok';
+		} catch (e) {
+			siteState = 'fail:selfcheck';
+			console.error(JSON.stringify({ m: 'site-remote', fail: String((e && e.message) || e).slice(0, 300) }));
+			throw e;
+		}
+	}
 
 	php.onMessage(handleMessage);
 

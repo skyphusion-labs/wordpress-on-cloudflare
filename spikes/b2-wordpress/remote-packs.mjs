@@ -222,3 +222,44 @@ export function createRemotePacks({ index, fetchPack, parse, stats, cap = REMOTE
 		hotHeld: () => hot !== null,
 	};
 }
+
+// #569 (Gate 2, the HYBRID): the loader hooks for SITE files (site.zip names, no leading slash).
+// OPcache opens a .php source it then serves from its cache WITHOUT reading it (step 3, #394
+// issuecomment-6879862441: 37,721 of 37,721 opened-but-unread site files were .php), so:
+// - a .php is fetched at its FIRST READ (pagefeatherRead, prepare.sh PY6), and pinned from that read
+//   to its close;
+// - every other site file is fetched at its OPEN (pagefeatherOpen, PY5), and pinned from the open, so
+//   a failure stays a clean false (a failed READ makes @file_get_contents return "", Gate 0b).
+// The node gets pagefeatherName and pagefeatherPin from attachLazyContents (tag.pin 'read').
+export function createSiteHooks(remote, isPhp = (name) => name.endsWith('.php')) {
+	return {
+		pinMode: (name) => (isPhp(name) ? 'read' : 'open'),
+		// null: open now (not a site file, a .php, or its pack is held). A promise: wait for the pack.
+		open(path) {
+			const name = path.charCodeAt(0) === 47 ? path.slice(1) : path;
+			if (remote.files[name] === undefined || isPhp(name)) return null;
+			return remote.open(name);
+		},
+		read(stream) {
+			const node = stream && stream.node;
+			if (!node || typeof node.pagefeatherPin !== 'function' || stream.pfPinned) return null;
+			const p = remote.open(node.pagefeatherName);
+			if (!p) {
+				node.pagefeatherPin(stream); // throws EIO (an ErrnoError) if the bytes cannot be had
+				return null;
+			}
+			return p.then(() => node.pagefeatherPin(stream));
+		},
+	};
+}
+
+// #569: the BOOT SELF-CHECK (after Gate 0b's red control read files as EMPTY, silently). A known
+// remote .php (site-remote.py records [name, size, sha256]) is read through PHP at boot: the read
+// path a site depends on. Anything but its exact size and SHA-256 fails the boot, loudly.
+export function selfCheckCode([name]) {
+	return '<?php $c = @file_get_contents(' + JSON.stringify('/' + name) + '); echo is_string($c) ? strlen($c) . "|" . hash("sha256", $c) : "false";';
+}
+export function checkSelfCheck(text, [name, size, sha256]) {
+	const want = size + '|' + sha256;
+	if (String(text).trim() !== want) throw new Error('site self-check failed: /' + name + ' read as ' + JSON.stringify(String(text).slice(0, 80)) + ', want ' + want + ' (SITE_REMOTE reads are not working; the boot is refused)');
+}

@@ -14,7 +14,8 @@ Writes, under build/public/_pf/<build-id>/ beside the oc-<n>.zip packs (which it
   build/site.zip    EMPTY (no site file stays in the bundle)
   build/site-remote-index.js
                     export default { id, hot: { name, bytes, sha256 }, packs: [...], files: { name:
-                    [pack, size] } (pack -1 = hot), dirs: [every directory, empty ones too] }
+                    [pack, size] } (pack -1 = hot), dirs: [every directory, empty ones too],
+                    selfcheck: [a small .php, its size, its SHA-256] (read through PHP at boot) }
 """
 import hashlib, io, json, os, re, sys, zipfile
 
@@ -105,7 +106,14 @@ def main():
         acc += entries[n].compress_size + 30 + len(n)
     if cur:
         packs.append(write('st-%d.zip' % len(packs), cur))
-    idx = {'id': build_id, 'hot': hot_pack, 'packs': packs, 'files': files, 'dirs': sorted(dirs)}
+    # The boot self-check (#569): the smallest .php of the hot set (no extra fetch at boot), else the
+    # smallest .php. index.js reads it through PHP at boot and compares size and SHA-256.
+    php = [n for n in hot if n.endswith('.php')] or [n for n in entries if n.endswith('.php')]
+    if not php:
+        sys.exit('site-remote: no .php in site.zip for the boot self-check')
+    sc = min(php, key=lambda n: (entries[n].file_size, n))
+    selfcheck = [sc, entries[sc].file_size, hashlib.sha256(src.read(entries[sc])).hexdigest()]
+    idx = {'id': build_id, 'hot': hot_pack, 'packs': packs, 'files': files, 'dirs': sorted(dirs), 'selfcheck': selfcheck}
     zipfile.ZipFile(zpath, 'w').close()
     open(os.path.join(d, 'site-remote-index.js'), 'w').write('export default %s;\n' % json.dumps(idx, separators=(',', ':')))
     print('site remote (#569): %d files (%d traced), hot %d files %.1f KiB, %d pack(s) %.2f MiB, %d dirs, under _pf/%s; site.zip empty' % (

@@ -413,6 +413,11 @@ jobs:
         # back whole with the pin and must NOT without it; a 40,000-call stat storm makes 0 fetches.
         working-directory: spikes/b2-wordpress
         run: node --test tests/site-remote.test.mjs
+      - name: php-wasm calls no export that cannot suspend; our code reads no site .php directly (issue #569)
+        # A read inside an export outside exportPattern throws SuspendError (Gate 0b); a failed .php read
+        # gives @file_get_contents "", so our PHP and JS must never read a site .php themselves.
+        working-directory: spikes/b2-wordpress
+        run: node --test tests/phpwasm-exports.test.mjs tests/our-file-reads.test.mjs
   coverage:
     runs-on: ubuntu-latest
     steps:

@@ -129,6 +129,95 @@ s = s.replace(old, new)
 open(p, 'w').write(s)
 PY5
 
+# PHP pauses in a READ while the Worker fetches a site .php (#569, #394 Gate 2, the hybrid). OPcache
+# opens a source it then serves from its cache without reading it (step 3: 37,721 of 37,721
+# opened-but-unread site files were .php), so a .php is fetched at its FIRST READ, not its open.
+# PHP's read() goes through php-wasm's own js_fd_read import, which is ALREADY Suspending in the stock
+# importPattern; WASI fd_read and _mmap_js (readfile, copy, fpassthru use mmap) are made Suspending only
+# when a pagefeatherRead hook is set. Each asks the hook first: a promise means wait, a rejection
+# fails the read with EIO before any byte is delivered. There is no fd_pread import in this wasm.
+# Proven on production workerd (Gate 0b, #394 issuecomment-6879785529, 9 of 9 cases x3).
+python3 - <<'PY6'
+p = 'vendor/php_8_3.js'; s = open(p).read()
+old = "(x === '__syscall_openat' && typeof Module['pagefeatherOpen'] == 'function');"
+new = ("(x === '__syscall_openat' && typeof Module['pagefeatherOpen'] == 'function') ||\n"
+       "\t\t\t\t\t\t// Pagefeather (#569): reads may pause, only when a pagefeatherRead hook is set.\n"
+       "\t\t\t\t\t\t((x === 'fd_read' || x === '_mmap_js') && typeof Module['pagefeatherRead'] == 'function');")
+assert s.count(old) == 1, 'read import pattern patch did not apply'
+s = s.replace(old, new)
+old = """			var stream = SYSCALLS.getStreamFromFD(fd);
+			var num = doReadv(stream, iov, iovcnt);
+			HEAPU32[pnum >> 2] = num;
+			return 0;"""
+new = """			var stream = SYSCALLS.getStreamFromFD(fd);
+			// Pagefeather (#569): a .php whose pack is not held yet: wait for it, then read.
+			var pfR = Module['pagefeatherRead'] ? Module['pagefeatherRead'](stream, 'read') : null;
+			if (pfR) {
+				return pfR.then(() => {
+					try {
+						var n2 = doReadv(stream, iov, iovcnt);
+						HEAPU32[pnum >> 2] = n2;
+						return 0;
+					} catch (e) {
+						if (typeof FS == 'undefined' || !(e.name === 'ErrnoError')) throw e;
+						return e.errno;
+					}
+				}, () => 29);
+			}
+			var num = doReadv(stream, iov, iovcnt);
+			HEAPU32[pnum >> 2] = num;
+			return 0;"""
+assert s.count(old) == 1, 'fd_read hook patch did not apply'
+s = s.replace(old, new)
+old = """			var stream = SYSCALLS.getStreamFromFD(fd);
+			var res = FS.mmap(stream, len, offset, prot, flags);"""
+new = """			var stream = SYSCALLS.getStreamFromFD(fd);
+			// Pagefeather (#569): the same for an mmap of a .php.
+			var pfM = Module['pagefeatherRead'] ? Module['pagefeatherRead'](stream, 'mmap') : null;
+			if (pfM) {
+				return pfM.then(() => {
+					try {
+						var r2 = FS.mmap(stream, len, offset, prot, flags);
+						HEAP32[allocated >> 2] = r2.allocated;
+						HEAPU32[addr >> 2] = r2.ptr;
+						return 0;
+					} catch (e) {
+						if (typeof FS == 'undefined' || !(e.name === 'ErrnoError')) throw e;
+						return -e.errno;
+					}
+				}, () => -29);
+			}
+			var res = FS.mmap(stream, len, offset, prot, flags);"""
+assert s.count(old) == 1, 'mmap hook patch did not apply'
+s = s.replace(old, new)
+old = """			var stream;
+			try {
+				stream = SYSCALLS.getStreamFromFD(fd);
+				HEAPU32[pnum >> 2] = doReadv(stream, iov, iovcnt);
+				return 0;"""
+new = """			var stream;
+			try {
+				stream = SYSCALLS.getStreamFromFD(fd);
+				// Pagefeather (#569): js_fd_read is PHP's read(); already Suspending in the stock pattern.
+				var pfJ = Module['pagefeatherRead'] ? Module['pagefeatherRead'](stream, 'read') : null;
+				if (pfJ) {
+					return pfJ.then(() => {
+						try {
+							HEAPU32[pnum >> 2] = doReadv(stream, iov, iovcnt);
+							return 0;
+						} catch (e2) {
+							if (typeof FS == 'undefined' || !(e2.name === 'ErrnoError')) throw e2;
+							return e2.errno;
+						}
+					}, () => 29);
+				}
+				HEAPU32[pnum >> 2] = doReadv(stream, iov, iovcnt);
+				return 0;"""
+assert s.count(old) == 1, 'js_fd_read hook patch did not apply'
+s = s.replace(old, new)
+open(p, 'w').write(s)
+PY6
+
 # The module reserves 64 MiB (1024 pages) at start. A Worker isolate has 128 MB
 # for everything, so start at 24 MiB (384 pages) and let it grow on demand.
 # Its static data ends at 12.4 MiB. Both values are 2-byte LEB128, so the patch
