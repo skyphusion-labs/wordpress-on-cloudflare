@@ -497,3 +497,31 @@ test('a clean request never pays the relabel: recovery with nothing open writes 
 	assert.equal(b.u.counts().own, 0, 'no row written by a recovery that found nothing');
 	assert.equal(b.u.status(db, 'e4').state, 'kept');
 });
+
+// A mutation gap (ROLLBACK TO dropping its own savepoint survived the suite), and the case a seq REUSE
+// would break: after ROLLBACK TO p clears the log above p, new rows may take the cleared seqs (they always
+// do without AUTOINCREMENT). Savepoints that are still live hold seqs at or below the log's top, so new rows
+// are always above every one of them.
+test('ROLLBACK TO the same savepoint twice, with writes and an inner savepoint between (seq reuse is safe)', () => {
+	const { db, storage } = site();
+	const a = isolate();
+	a.u.arm(db, 's1');
+	run(a.u, db, "INSERT INTO t (v) VALUES ('pre')");
+	a.u.txnOp(db, storage, { op: 'begin' });
+	run(a.u, db, "INSERT INTO t (v) VALUES ('in')");
+	a.u.txnOp(db, storage, { op: 'savepoint', name: 'p' });
+	run(a.u, db, "INSERT INTO t (v) VALUES ('X')");
+	assert.deepEqual(a.u.txnOp(db, storage, { op: 'rollback_to', name: 'p' }), { ok: true, undone: 1 });
+	run(a.u, db, "INSERT INTO t (v) VALUES ('Y')"); // may reuse X's seq
+	a.u.txnOp(db, storage, { op: 'savepoint', name: 'q' });
+	run(a.u, db, "UPDATE t SET v = 'Y2' WHERE v = 'Y'");
+	run(a.u, db, "INSERT INTO t (v) VALUES ('Z')");
+	assert.deepEqual(a.u.txnOp(db, storage, { op: 'rollback_to', name: 'q' }), { ok: true, undone: 2 });
+	assert.deepEqual(ids(db), ['seed', 'pre', 'in', 'Y'], 'q undid Z and the update, Y stays');
+	assert.deepEqual(a.u.txnOp(db, storage, { op: 'rollback_to', name: 'p' }), { ok: true, undone: 1 }, 'p is still live after its first ROLLBACK TO');
+	assert.deepEqual(ids(db), ['seed', 'pre', 'in']);
+	a.u.txnOp(db, storage, { op: 'commit' });
+	// The frame still covers all of it: a reset now rolls back to before 'pre'.
+	isolate().u.recover(db, storage);
+	assert.deepEqual(ids(db), ['seed']);
+});
