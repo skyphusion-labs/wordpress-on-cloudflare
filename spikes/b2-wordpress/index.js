@@ -649,9 +649,24 @@ function attachLazyContents(node, size, dataFn, tag) {
 	// view into the bundle, the inflate cache or the arena) and mark the file written. msync calls
 	// MEMFS.stream_ops.write directly, so it is wrapped too.
 	const base = node.stream_ops;
-	if (pin && base) {
+	// #569 (Gate 2, step 3): FILE_TRACE=on also records each OPEN of a bundle file, as "<src>-open:" keys
+	// beside the reads (the contents getter). The open() hook fetches on an open, and PHP opens files it
+	// never reads (OPcache resolves a source it serves from its cache), so a trace of reads alone
+	// measured the wrong event. Off with FILE_TRACE; consumers that match "site:" or "opcache:" never
+	// see these keys.
+	if (tag && base && tracing()) {
+		const tbase = node.stream_ops;
+		node.stream_ops = Object.assign(Object.create(tbase), {
+			open(stream) {
+				fileTrace.read(tag.src + '-open', tag.path, size);
+				if (typeof tbase.open === 'function') tbase.open(stream);
+			},
+		});
+	}
+	const base2 = node.stream_ops;
+	if (pin && base2) {
 		// #569: FS.open copies node.stream_ops into the stream and calls its open, FS.close its close.
-		const pinned = Object.create(base);
+		const pinned = Object.create(base2);
 		pinned.open = function (stream) {
 			pins++;
 			try {
@@ -660,11 +675,11 @@ function attachLazyContents(node, size, dataFn, tag) {
 				pins--;
 				throw e;
 			}
-			if (typeof base.open === 'function') base.open(stream);
+			if (typeof base2.open === 'function') base2.open(stream);
 		};
 		pinned.close = function (stream) {
 			if (pins > 0) pins--;
-			if (typeof base.close === 'function') base.close(stream);
+			if (typeof base2.close === 'function') base2.close(stream);
 		};
 		node.stream_ops = pinned;
 	}
