@@ -2718,6 +2718,15 @@ export class PhpRuntime extends DurableObject {
 		const env = this.env;
 		ENV = env;
 		const objectUrl = new URL(raw.url);
+		// #352: the outcome of a request's frame, for the front Worker's write-loss answer (never a client: the
+		// Worker answers a client's /_frame itself). It needs no public origin, so it is answered before the
+		// origin guard below (pf352f at ebb62f5: every probe got 500 "missing x-wp-public-origin").
+		if (objectUrl.pathname === '/_frame') {
+			const db = env.DB_IN_DO === 'on' ? this.ctx.storage.sql : null;
+			if (!db || env.REAL_TRANSACTIONS === 'off') return Response.json({ frame: null, reason: 'no undo log' });
+			txnRecover(db, this.ctx.storage);
+			return Response.json({ frame: undo(env).status(db, objectUrl.searchParams.get('id') || '') });
+		}
 		const origin = raw.headers.get(ORIGIN_HEADER);
 		// Without it, the object does not guess an origin: a wrong one redirects every page.
 		if (!origin) return new Response('missing ' + ORIGIN_HEADER, { status: 500 });
@@ -2775,13 +2784,6 @@ export class PhpRuntime extends DurableObject {
 		// until it dies, streaming the count (headroom.mjs). The first line is the ledger at that moment, so
 		// 255 (a bare isolate, #394 floor probes) minus the reach minus its wasmMiB is what the runtime holds
 		// outside the wasm heap. No PHP lock: it never runs PHP. gc reports whether a forced GC exists.
-		// #352: the outcome of a request's frame, for the front Worker's write-loss answer (never a client).
-		if (url.pathname === '/_frame') {
-			const db = env.DB_IN_DO === 'on' ? this.ctx.storage.sql : null;
-			if (!db || env.REAL_TRANSACTIONS === 'off') return Response.json({ frame: null, reason: 'no undo log' });
-			txnRecover(db, this.ctx.storage);
-			return Response.json({ frame: undo(env).status(db, url.searchParams.get('id') || '') });
-		}
 		if (url.pathname === '/_headroom') {
 			if (env.HEADROOM_PROBE !== 'on') return new Response('Not Found', { status: 404 });
 			const snap = ledgerSnapshot('headroom');
@@ -3769,7 +3771,7 @@ async function handle(req, env, url, spikeOk, maxBody, ctx) {
 					...(booted && SITE_REMOTE ? { siteRemote: siteState } : {}), // #569: the remote site packs at this boot
 					// #352: this request's frame: opened (the first write armed it), commit points, misses, and the
 					// rows its PHP transactions undid. Only with REQUEST_FRAMES=on.
-					...(env.REQUEST_FRAMES === 'on' && undoLog && frame0 ? (() => { const c = undoLog.counts(); return { frame: { opened: c.opened - frame0.opened, kept: c.kept - frame0.kept, points: c.points - frame0.points, miss: c.miss - frame0.miss, noop: c.noop - frame0.noop, ...(c.opened > frame0.opened ? { by: undoLog.openedBy() } : {}) } }; })() : {}),
+					...(env.REQUEST_FRAMES === 'on' && undoLog && frame0 ? (() => { const c = undoLog.counts(); return { frame: { opened: c.opened - frame0.opened, kept: c.kept - frame0.kept, points: c.points - frame0.points, miss: c.miss - frame0.miss, noop: c.noop - frame0.noop, own: c.own - frame0.own, ...(c.opened > frame0.opened ? { by: undoLog.openedBy(), req: req.headers.get('x-pf-req') || null } : {}) } }; })() : {}),
 					// #569: site pack fetches this request (subrequests, the one retry included), KiB, ms,
 					// the failed ones (an honest 500 if PHP required the file), the retries, the opens past
 					// the hard cap, the distinct packs, and the held high-water (the hot pack not included).

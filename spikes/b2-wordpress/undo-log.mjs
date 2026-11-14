@@ -85,14 +85,17 @@ export function createUndoLog({ stats, objectCacheDrop = () => {}, log = () => {
 	let kinds = [];
 	let deferred = [];
 	let recovered = false;
-	const counts = { opened: 0, kept: 0, points: 0, miss: 0, noop: 0 };
+	const counts = { opened: 0, kept: 0, points: 0, miss: 0, noop: 0, own: 0 };
+	// The rows the undo log and the frame write THEMSELVES (state, frame rows, the log cleared or replayed),
+	// which x-db-rows never sees: it counts PHP's statements, their undo-trigger rows included.
+	const own = (cur) => { counts.own += (cur && cur.rowsWritten) || 0; return cur; };
 	let openedBy = null; // the shape (verb and table, never values) of the statement that opened the last frame
 
 	function undoSetup(db) {
 		if (setupDone) return;
 		db.exec('CREATE TABLE IF NOT EXISTS _wp_undo (seq INTEGER PRIMARY KEY AUTOINCREMENT, sql TEXT NOT NULL)');
 		db.exec('CREATE TABLE IF NOT EXISTS _wp_undo_state (id INTEGER PRIMARY KEY CHECK (id = 1), active INTEGER NOT NULL)');
-		db.exec('INSERT OR IGNORE INTO _wp_undo_state (id, active) VALUES (1, 0)');
+		own(db.exec('INSERT OR IGNORE INTO _wp_undo_state (id, active) VALUES (1, 0)'));
 		if (framesOn()) db.exec('CREATE TABLE IF NOT EXISTS _wp_frame (req TEXT PRIMARY KEY, state TEXT NOT NULL, points INTEGER NOT NULL, kinds TEXT NOT NULL, undone INTEGER NOT NULL, t INTEGER NOT NULL)');
 		setupDone = true;
 	}
@@ -123,14 +126,14 @@ export function createUndoLog({ stats, objectCacheDrop = () => {}, log = () => {
 		undoSchemaSig = schemaSig(db);
 	}
 	const undoSeq = (db) => db.exec('SELECT COALESCE(MAX(seq), 0) AS s FROM _wp_undo').one().s;
-	const setActive = (db, on) => db.exec('UPDATE _wp_undo_state SET active = ? WHERE id = 1', on ? 1 : 0);
+	const setActive = (db, on) => own(db.exec('UPDATE _wp_undo_state SET active = ? WHERE id = 1', on ? 1 : 0));
 	// Undo every change after seq, newest first, in one storage transaction.
 	function undoTo(db, storage, seq) {
 		setActive(db, false);
 		const rows = [...db.exec('SELECT sql FROM _wp_undo WHERE seq > ? ORDER BY seq DESC', seq).raw()];
 		const apply = () => {
-			for (const [stmt] of rows) db.exec(stmt);
-			db.exec('DELETE FROM _wp_undo WHERE seq > ?', seq);
+			for (const [stmt] of rows) own(db.exec(stmt));
+			own(db.exec('DELETE FROM _wp_undo WHERE seq > ?', seq));
 		};
 		if (storage && typeof storage.transactionSync === 'function') storage.transactionSync(apply);
 		else apply();
@@ -145,11 +148,11 @@ export function createUndoLog({ stats, objectCacheDrop = () => {}, log = () => {
 		txnTouched.clear();
 		if (!frameOpen) {
 			setActive(db, false);
-			db.exec('DELETE FROM _wp_undo');
+			own(db.exec('DELETE FROM _wp_undo'));
 		}
 	}
 	function frameRow(db, req, state) {
-		db.exec('INSERT INTO _wp_frame (req, state, points, kinds, undone, t) VALUES (?, ?, ?, ?, 0, ?) ON CONFLICT (req) DO UPDATE SET state = excluded.state, points = excluded.points, kinds = excluded.kinds, t = excluded.t', req, state, points, kinds.join(','), Date.now());
+		own(db.exec('INSERT INTO _wp_frame (req, state, points, kinds, undone, t) VALUES (?, ?, ?, ?, 0, ?) ON CONFLICT (req) DO UPDATE SET state = excluded.state, points = excluded.points, kinds = excluded.kinds, t = excluded.t', req, state, points, kinds.join(','), Date.now()));
 	}
 	function frameOpenNow(db, sql) {
 		openedBy = sql ? shapeOf(sql) : 'php-begin';
@@ -159,13 +162,13 @@ export function createUndoLog({ stats, objectCacheDrop = () => {}, log = () => {
 		frameOpen = true;
 		counts.opened++;
 		frameRow(db, armedReq, 'open');
-		db.exec('DELETE FROM _wp_frame WHERE req NOT IN (SELECT req FROM _wp_frame ORDER BY t DESC LIMIT ?)', FRAME_HISTORY);
+		own(db.exec('DELETE FROM _wp_frame WHERE req NOT IN (SELECT req FROM _wp_frame ORDER BY t DESC LIMIT ?)', FRAME_HISTORY));
 	}
 	// Close the frame KEPT: its rows stay, the log goes, deferred work runs.
 	function frameKeep(db, state) {
 		if (txnFrames) txnFrames = txnFrames.map((f) => ({ ...f, seq: 0 })); // a PHP txn spanning a commit point keeps what came before it
 		setActive(db, false);
-		db.exec('DELETE FROM _wp_undo');
+		own(db.exec('DELETE FROM _wp_undo'));
 		frameOpen = false;
 		frameRow(db, armedReq, state);
 		const work = deferred;
@@ -213,6 +216,7 @@ export function createUndoLog({ stats, objectCacheDrop = () => {}, log = () => {
 				return fn();
 			}
 			const NOOP = {};
+			const own0 = counts.own;
 			let result;
 			try {
 				storage.transactionSync(() => {
@@ -230,6 +234,7 @@ export function createUndoLog({ stats, objectCacheDrop = () => {}, log = () => {
 				// undoTriggers may have created triggers inside the rolled-back transaction: check again next time.
 				undoSchemaSig = null;
 				setupDone = false;
+				counts.own = own0; // the rolled-back transaction wrote nothing
 				if (e !== NOOP) throw e;
 				counts.noop++;
 				return result;
@@ -343,14 +348,14 @@ export function createUndoLog({ stats, objectCacheDrop = () => {}, log = () => {
 				return null;
 			}
 			const n = undoTo(db, storage, 0);
-			db.exec('DELETE FROM _wp_undo');
+			own(db.exec('DELETE FROM _wp_undo'));
 			txnFrames = null;
 			let req = null;
 			try {
 				const r = [...db.exec("SELECT req FROM _wp_frame WHERE state = 'open' ORDER BY t DESC LIMIT 1").raw()];
 				if (r.length) {
 					req = r[0][0];
-					db.exec("UPDATE _wp_frame SET state = 'rolled-back', undone = ? WHERE req = ?", n, req);
+					own(db.exec("UPDATE _wp_frame SET state = 'rolled-back', undone = ? WHERE req = ?", n, req));
 				}
 			} catch {
 				// frames were never on here
