@@ -182,6 +182,9 @@ export function createRemotePacks({ index, fetchPack, parse, stats, cap = REMOTE
 				throw e;
 			},
 		);
+		// A stale fetch (its request ended) rejects into a chain nobody awaits any more; mark it handled
+		// so it never logs as an unhandled rejection. Anyone who IS waiting still gets the rejection.
+		p.catch(() => {});
 		pending.set(packNo, p);
 		return p;
 	}
