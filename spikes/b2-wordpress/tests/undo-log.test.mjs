@@ -33,7 +33,7 @@ function objectSql() {
 			try { const r = fn(); d.exec('RELEASE ts'); return r; } catch (e) { d.exec('ROLLBACK TO ts'); d.exec('RELEASE ts'); throw e; }
 		},
 	};
-	return { db: { exec }, storage };
+	return { db: { exec, storage }, storage };
 }
 function isolate(frames = true) {
 	const dropped = [];
@@ -42,12 +42,22 @@ function isolate(frames = true) {
 	const u = createUndoLog({ stats, objectCacheDrop: (k) => dropped.push(k), log: (o) => logs.push(o), frames });
 	return { u, stats, dropped, logs };
 }
-// What PHP's statements do through index.js sqlStatement: ensure before a write, then run it.
+// What PHP's statements do through index.js sqlStatement: the statement runs inside u.statement(), which
+// opens the frame just before it when it may write, and takes the open back if it changed nothing.
+// The reply is shaped like sqlStatement's: changes from total_changes(), last_row_id after an insert.
+function reply(db, sql, cur) {
+	return { changes: cur.changes, last_row_id: cur.changes > 0 && /^\s*(INSERT|REPLACE)\b/i.test(sql) ? db.exec('SELECT last_insert_rowid() AS r').one().r : 0 };
+}
 function run(u, db, sql, ...p) {
-	u.beforeStatement(db, sql);
-	const cur = db.exec(sql, ...p);
-	u.afterStatement(db, sql, cur.rowsWritten);
-	return cur;
+	const storage = db.storage;
+	return u.statement(db, storage, sql, () => {
+		const before = db.exec('SELECT total_changes() AS c').one().c;
+		const cur = db.exec(sql, ...p);
+		const after = db.exec('SELECT total_changes() AS c').one().c;
+		cur.changes = after === before ? 0 : db.exec('SELECT changes() AS c').one().c;
+		u.afterStatement(db, sql, cur.rowsWritten);
+		return cur;
+	});
 }
 const ids = (db) => [...db.exec('SELECT v FROM t ORDER BY id').raw()].map((r) => r[0]);
 function site() {
@@ -57,9 +67,12 @@ function site() {
 	return s;
 }
 
-test('mayWrite: reads never open a frame; everything else does (conservative)', () => {
-	for (const q of ['SELECT 1', ' select * from t', 'EXPLAIN SELECT 1', 'PRAGMA table_info(t)', 'PRAGMA foreign_keys']) assert.equal(mayWrite(q), false, q);
-	for (const q of ['INSERT INTO t VALUES (1)', 'UPDATE t SET v = 1', 'DELETE FROM t', 'REPLACE INTO t VALUES (1)', 'WITH x AS (SELECT 1) INSERT INTO t SELECT * FROM x', 'SELECT 1 RETURNING 1', 'PRAGMA foreign_keys = ON', 'CREATE TABLE z (a)']) assert.equal(mayWrite(q), true, q);
+test('mayWrite: reads and statements that change no covered row never open a frame; everything else does (conservative)', () => {
+	// A PRAGMA (a setter too), VACUUM, ANALYZE and REINDEX change no row of a table the undo triggers cover
+	// (CI at 105776b: a PRAGMA opened the frame of 10 of 10 public GETs). They must also never run inside the
+	// opening transaction: SQLite ignores PRAGMA foreign_keys there, and VACUUM refuses to run in one.
+	for (const q of ['SELECT 1', ' select * from t', 'EXPLAIN SELECT 1', 'PRAGMA table_info(t)', 'PRAGMA foreign_keys', 'PRAGMA foreign_keys = ON', ' pragma journal_mode=WAL;', 'VACUUM', 'ANALYZE', 'REINDEX t']) assert.equal(mayWrite(q), false, q);
+	for (const q of ['INSERT INTO t VALUES (1)', 'UPDATE t SET v = 1', 'DELETE FROM t', 'REPLACE INTO t VALUES (1)', 'WITH x AS (SELECT 1) INSERT INTO t SELECT * FROM x', 'SELECT 1 RETURNING 1', 'CREATE TABLE z (a)']) assert.equal(mayWrite(q), true, q);
 	assert.equal(isDdl('CREATE TABLE z (a)'), true);
 	assert.equal(isDdl('INSERT INTO t VALUES (1)'), false);
 });
@@ -269,9 +282,104 @@ test('shapeOf names the verb and table of the statement that opened a frame, nev
 	assert.equal(shapeOf("UPDATE wp_options SET option_value = 'x' WHERE option_name = 'y'"), 'UPDATE wp_options');
 	assert.equal(shapeOf('DELETE FROM wp_woocommerce_sessions WHERE session_expiry < 5'), 'DELETE wp_woocommerce_sessions');
 	assert.equal(shapeOf("INSERT INTO t (a) VALUES (1) ON CONFLICT (a) DO NOTHING"), 'INSERT t ON CONFLICT');
+	assert.equal(shapeOf('PRAGMA foreign_keys = ON'), 'PRAGMA foreign_keys');
 	const { db } = site();
 	const a = isolate();
 	a.u.arm(db, 'by1');
-	run(a.u, db, "UPDATE t SET v = 'x' WHERE v = 'none'");
+	run(a.u, db, "UPDATE t SET v = 'x' WHERE v = 'seed'");
 	assert.equal(a.u.openedBy(), 'UPDATE t');
+});
+
+// #352 laziness (CI red at 8d557c7: 10 of 10 public GETs opened a frame with 0 rows written). The open,
+// the statement and its first undo row run in ONE storage transaction; a statement that changed no row
+// takes the open back, so it commits nothing durable.
+// No undo tables at all (the open was taken back before anything else created them) is active 0 too.
+const activeFlag = (db) => { try { return db.exec('SELECT active FROM _wp_undo_state WHERE id = 1').one().active; } catch { return 0; } };
+const frameRows = (db) => { try { return db.exec('SELECT COUNT(*) AS n FROM _wp_frame').one().n; } catch { return 0; } };
+const NOOPS = ["UPDATE t SET v = 'x' WHERE v = 'none'", "DELETE FROM t WHERE v = 'none'", "INSERT OR IGNORE INTO t (id, v) VALUES (1, 'dup')"];
+
+test('NO-OP WRITE: a write statement that changes no row leaves no frame (no _wp_frame row, active 0)', () => {
+	for (const sql of NOOPS) {
+		const { db } = site();
+		const { u } = isolate();
+		u.arm(db, 'n1');
+		run(u, db, sql);
+		assert.equal(u.frameOpen(), false, sql);
+		u.end(db);
+		assert.equal(u.status(db, 'n1'), null, 'no frame row: ' + sql);
+		assert.equal(frameRows(db), 0, sql);
+		assert.equal(activeFlag(db), 0, sql);
+		assert.equal(u.counts().opened, 0, sql);
+		assert.equal(u.counts().noop, 1, sql);
+	}
+});
+
+test('NO-OP WRITE: what PHP sees is identical to frames off (changes 0, last insert id, no error)', () => {
+	for (const sql of NOOPS) {
+		const on = site();
+		const off = site();
+		const a = isolate(true);
+		const b = isolate(false);
+		a.u.arm(on.db, 'n2');
+		b.u.arm(off.db, 'n2');
+		// A real insert first on both, outside any frame, so last_insert_rowid has a value to keep.
+		on.db.exec("INSERT INTO t (v) VALUES ('pre')");
+		off.db.exec("INSERT INTO t (v) VALUES ('pre')");
+		const rOn = run(a.u, on.db, sql);
+		const rOff = run(b.u, off.db, sql);
+		assert.deepEqual(reply(on.db, sql, rOn), reply(off.db, sql, rOff), sql);
+		assert.equal(rOn.changes, 0, sql);
+		assert.equal(on.db.exec('SELECT changes() AS c').one().c, off.db.exec('SELECT changes() AS c').one().c, 'changes(): ' + sql);
+		assert.deepEqual(ids(on.db), ids(off.db), sql);
+	}
+});
+
+test('NO-OP then a REAL write: the real write opens the frame and a reset rolls it back', () => {
+	const { db, storage } = site();
+	const a = isolate();
+	a.u.arm(db, 'n3');
+	run(a.u, db, NOOPS[0]);
+	assert.equal(a.u.frameOpen(), false);
+	run(a.u, db, "INSERT INTO t (v) VALUES ('A')");
+	assert.equal(a.u.frameOpen(), true);
+	assert.equal(a.u.openedBy(), 'INSERT t');
+	isolate().u.recover(db, storage);
+	assert.deepEqual(ids(db), ['seed']);
+});
+
+test('an UNDO ROW decides, not the reported row count: a write reported as 0 rows keeps its frame', () => {
+	// The adapter reports rowsWritten 0 for a statement that returns rows (RETURNING), as a counter could
+	// under-report: the trigger still logged the before-image, so the frame must stay and cover it.
+	const { db, storage } = site();
+	const a = isolate();
+	a.u.arm(db, 'n4');
+	const cur = run(a.u, db, "UPDATE t SET v = 'changed' WHERE v = 'seed' RETURNING id");
+	assert.equal(cur.rowsWritten, 0, 'the instrument under-reports here, by construction');
+	assert.equal(a.u.frameOpen(), true, 'the undo row keeps the frame');
+	isolate().u.recover(db, storage);
+	assert.deepEqual(ids(db), ['seed'], 'the RETURNING update is undone');
+});
+
+test('a statement that THROWS inside the opening transaction takes the open back and rethrows the same error', () => {
+	const { db } = site();
+	const { u } = isolate();
+	u.arm(db, 'n5');
+	assert.throws(() => run(u, db, 'UPDATE no_such_table SET v = 1'), /no_such_table/);
+	assert.equal(u.frameOpen(), false);
+	assert.equal(frameRows(db), 0);
+	assert.equal(activeFlag(db), 0);
+});
+
+test('a PRAGMA setter while armed opens no frame and still TAKES EFFECT (it never runs inside a transaction)', () => {
+	const { db } = site();
+	const { u } = isolate();
+	u.arm(db, 'n6');
+	// node:sqlite starts with foreign keys ON, so the setter that can be seen to change something is OFF.
+	assert.equal(db.exec('PRAGMA foreign_keys').one().foreign_keys, 1, 'the instrument: it starts ON');
+	run(u, db, 'PRAGMA foreign_keys = OFF');
+	assert.equal(u.frameOpen(), false);
+	assert.equal(db.exec('PRAGMA foreign_keys').one().foreign_keys, 0, 'the setting held');
+	u.end(db);
+	assert.equal(frameRows(db), 0);
+	assert.equal(u.counts().opened, 0);
 });
