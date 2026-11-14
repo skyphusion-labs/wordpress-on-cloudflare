@@ -58,8 +58,7 @@ jobs:
             echo "::error::file-trace.sh failed"; tail -30 build/file-trace.log; exit 1
           fi
           python3 -I opcache-remote.py build/opcache.zip build/file-trace.json build/build-id.js
-          # REMOTE_E2E_HOLDS: the fetch budget at larger held budgets, measured per page (#563).
-          if ! REMOTE_E2E_HOLDS="4096 8192" tests/remote-e2e.sh; then
+          if ! tests/remote-e2e.sh; then
             echo "::error::remote-e2e.sh failed; last lines of dev.log:"; tail -40 dev.log 2>/dev/null || true; exit 1
           fi
           echo "remote steps took $(( $(date +%s) - s )) s"

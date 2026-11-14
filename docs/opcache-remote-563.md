@@ -24,9 +24,9 @@ boot pack, and nothing held across requests.
   only when a `pagefeatherOpen` hook is set, and `___syscall_openat` asks the hook first.
   - A promise means PHP waits while the object fetches the file's pack (`remote-packs.mjs`).
   - Then the open runs as usual, and the node inflates from the held pack.
-- **The held budget** (`REMOTE_HOLD_KIB`, default 2048):
+- **The held budget** (`REMOTE_HOLD_KIB`, default 4096, the lead's choice on the measured table below):
   - packs are evicted least recently used first, and the pack being opened is always kept;
-  - a cold boot reads in about pack order, so it STREAMS with about 2 MiB held. L1 held its
+  - a cold boot STREAMS through the packs with about 3.2 MiB held (measured). L1 held its
     14 MiB boot pack ([issuecomment-6861958043](https://github.com/skyphusion-labs/pagefeather/issues/394#issuecomment-6861958043));
   - every pack is dropped at the end of the request (`endRequest()`, beside `evictLazy()`).
 
@@ -69,15 +69,25 @@ The wasm is unchanged. Under JSPI the loader picks the suspendable imports in JS
   - Workers Paid, Cloudflare services: "Subrequests to internal services: Matches configured
     limit (default 10,000)";
   - Free: 50, and 1,000 to internal services.
-- **Expected:** at 1 MiB packs, about 14 fetches on a cold boot request and about 21 over a
-  runtime's first requests. The basis is pf394a: 14.00 MiB of boot files and 6.65 MiB of warm
-  files, deflated.
-- **Measured on the first (warm-only, path-order) shape** in CI on local workerd
-  (opcache-build run 43601222273): 38 fetches over 4 fresh-runtime pages, for 14 packs, with 0
-  failures. Packs were dropped per request and in path order, so later pages fetched again. The
-  cold-boot order of this shape is meant to lower that; `rfN` measures it.
-- **The cap:** `REMOTE_FETCH_CAP` default **64** per request: 3x the expected 21, and 0.64 % of the
-  Paid limit. Past it, opens fail clean, long before the platform limit.
+- **Measured** (opcache-build run 43603733149, head 6dd6838, local workerd in CI, a store build of
+  2,128 files in 21 packs of about 1.1 MiB). After `/_install`, ONE runtime served four pages.
+  Each cell is fetches / distinct packs (`rfN` / `rfPacks`). `rfFail` and `rfCapped` were 0
+  throughout:
+
+  | held budget | boot (home) | shop | login | REST | 4 pages | peak held |
+  |---|---|---|---|---|---|---|
+  | 2048 KiB | 36 / 18 | 32 / 6 | 3 / 3 | 15 / 6 | 86 | 1,118 KiB |
+  | **4096 KiB (default)** | **20 / 18** | **9 / 6** | **3 / 3** | **7 / 6** | **39** | **3,270 KiB** |
+  | 8192 KiB | 18 / 18 | 6 / 6 | 3 / 3 | 6 / 6 | 33 | 7,565 KiB |
+
+  - A cold boot needs 18 of the 21 packs.
+  - **Correction (written 2026-11-14, measured 2026-11-14; supersedes the "about 14 per cold boot"
+    and "2 MiB, about 2 packs" of #394 issuecomment-6878206213):**
+    - packs end just over 1 MiB, so 2 MiB held ONE pack and thrashed;
+    - at 4 MiB a cold boot makes about **20** fetches.
+  - The first, warm-only path-order shape read 38 fetches over 4 pages for 14 packs (run 43601222273).
+- **The cap:** `REMOTE_FETCH_CAP` default **64** per request: 3x the measured 20 per cold boot, and
+  0.64 % of the Paid limit. Past it, opens fail clean, long before the platform limit.
   - A Free site, or a site with a lower `[limits] subrequests` or WfP `subRequests`, must set the
     cap below its own limit minus its other subrequests.
 
@@ -112,6 +122,9 @@ measures that.
 - **`deploy/wfp/tests/render-test.sh`:** the flag's render rules, including the refusal with the split.
 
 ## The proof (to run; nothing is claimed yet)
+
+**Run it only AFTER rollins-sb1114b's `dropRuntime()` fix merges (#394).** Today a dropped runtime
+stays pinned at about 165 MiB (the lead, 2026-11-14), and that leak would swamp this A/B.
 
 - **Expected gain:** all of `opcache.zip` leaves the module, about 21 MiB deflated on a store build
   (docs/design-394-bundle-out-of-memory.md 1.2), against today's live shape. ggc, ggc-test and

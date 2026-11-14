@@ -16,20 +16,22 @@
 // - a pack that failed is not fetched again in the same request; the next request tries again.
 // Every pack fetch is a subrequest (Gate 0, #394 issuecomment-6878010968: ASSETS.fetch counts
 // against the limit), so a request fetches at most `cap` packs. Past that, opens fail as above.
-// The held budget: at most holdBytes of packs are held (REMOTE_HOLD_KIB, default 2048), least
-// recently used out first; the pack being opened is always kept. A cold boot reads its files in
-// about pack order, so it STREAMS: about 2 MiB held, not the 14 MiB L1's boot pack held. A read of
+// The held budget: at most holdBytes of packs are held (REMOTE_HOLD_KIB, default 4096), least
+// recently used out first; the pack being opened is always kept. Packs end just over 1 MiB, so 4 MiB
+// holds three. Measured (opcache-build run 43603733149, one runtime, home/shop/login/REST): 2 MiB held
+// ONE pack and thrashed (86 fetches, 53 of them refetches); 4 MiB made 20 fetches on the cold boot
+// and 39 over the 4 pages, peak 3,270 KiB, against the 14 MiB L1's boot pack held. A read of
 // a file whose pack was evicted fails with EIO (the contents getter has the bytes or throws), and
 // OPcache compiles that script: never a half file. Every pack is dropped at the end of a request
 // (endRequest, next to evictLazy), so nothing is held across requests.
 //
 // The cap: Workers Paid allows 10,000 subrequests per invocation (Workers limits page, Nov 13 2026).
-// A cold boot fetches about 21 packs (14 MiB boot plus 6.65 MiB warm at 1 MiB, pf394a). 64 is 3x
-// that, and fails clean (a compile) far below the platform limit. A Free site (50) or a site with a
+// A cold boot fetches about 20 packs at the 4 MiB budget (measured above). 64 is 3x that, and fails
+// clean (a compile) far below the platform limit. A Free site (50) or a site with a
 // lower [limits] subrequests must set REMOTE_FETCH_CAP below its own limit.
 
 export const REMOTE_FETCH_CAP = 64;
-export const REMOTE_HOLD_BYTES = 2048 * 1024;
+export const REMOTE_HOLD_BYTES = 4096 * 1024;
 
 async function sha256hex(bytes) {
 	const h = new Uint8Array(await crypto.subtle.digest('SHA-256', bytes));

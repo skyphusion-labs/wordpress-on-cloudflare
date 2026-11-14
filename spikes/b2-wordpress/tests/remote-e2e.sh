@@ -69,10 +69,11 @@ print(1 if ($want) else 0)" "$line")"
   c2=$(curl -s -o /dev/null -w '%{http_code}' "${ST[@]}" "$B/_pf/$ID/oc-0.zip")
   ok "$label: /_pf/ packs are never served (stranger $c1, with the spike token $c2)" "$([ "$c1" = 404 ] && [ "$c2" = 404 ] && echo 1 || echo 0)"
 }
-# The held budget is REMOTE_HOLD_KIB (2048) plus the one pack being opened (about 1024 deflated).
-run_case remote "" "n('pages') == 4 and n('rfN') > 0 and n('rfFail') == 0 and n('rfCapped') == 0 and 0 < n('heldKiB') <= 3200 and d['remote'].startswith('packs_')"
+# The held budget is REMOTE_HOLD_KIB (default 4096) plus at most one pack over it (about 1.1 MiB).
+run_case remote "" "n('pages') == 4 and n('rfN') > 0 and n('rfFail') == 0 and n('rfCapped') == 0 and 0 < n('heldKiB') <= 4096 + 1200 and d['remote'].startswith('packs_')"
 run_case cap0 "REMOTE_FETCH_CAP:0" "n('pages') == 4 and n('rfN') == 0 and n('rfCapped') > 0"
-# REMOTE_E2E_HOLDS="4096 8192": measurement runs at larger held budgets (the fetch budget, #563).
+# REMOTE_E2E_HOLDS="2048 8192": measurement runs at other held budgets (the fetch budget, #563; the
+# table that chose 4096 is opcache-build run 43603733149).
 # The same checks, with the held bound scaled to the budget plus one pack.
 for h in ${REMOTE_E2E_HOLDS:-}; do
   run_case "remote-hold$h" "REMOTE_HOLD_KIB:$h" "n('pages') == 4 and n('rfN') > 0 and n('rfFail') == 0 and n('rfCapped') == 0 and 0 < n('heldKiB') <= $h + 1200 and d['remote'].startswith('packs_')"

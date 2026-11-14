@@ -6,7 +6,7 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { createHash } from 'node:crypto';
-import { createRemotePacks } from '../remote-packs.mjs';
+import { createRemotePacks, REMOTE_HOLD_BYTES, REMOTE_FETCH_CAP } from '../remote-packs.mjs';
 
 // Three packs of 1000 bytes; file fN lives in pack N. parse() gives each pack one entry.
 const bytes = [0, 1, 2].map((n) => new Uint8Array(1000).fill(n + 1));
@@ -96,4 +96,11 @@ test('distinct packs per request tell thrash from spread (x-perf rfPacks)', asyn
 	await open(r, 'f1');
 	r.endRequest();
 	assert.equal(r.lastDistinct(), 1, 'a new request counts from 0');
+});
+
+test('the defaults are the measured choice: 4 MiB held (3 packs of about 1.1 MiB), cap 64', () => {
+	// opcache-build run 43603733149: 2 MiB held ONE pack and thrashed (86 fetches over 4 pages);
+	// 4 MiB held three (39 fetches, 20 on the cold boot, peak 3,270 KiB). The lead chose 4 MiB.
+	assert.equal(REMOTE_HOLD_BYTES, 4096 * 1024);
+	assert.equal(REMOTE_FETCH_CAP, 64);
 });
