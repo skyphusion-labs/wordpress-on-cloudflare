@@ -39,6 +39,12 @@ lost). The fix-build admin round had 46 of 47 deaths with `x-write-loss` 1 or 3:
   isolate that died with it set is undone first.
   - That happens in the `PhpRuntime` constructor (`blockConcurrencyWhile`), before any request, alarm,
     `/_dbexport` or snapshot reads the database.
+- **Ended at reset.** A request killed after a commit point, with no write after it, has nothing active to
+  undo; its frame row still says `open` (a commit point writes `open`: the request goes on, its segment
+  kept). At recovery no request of the new isolate runs yet, so every row still `open` belongs to a dead
+  isolate and is relabeled `ended-at-reset` (the lead's ruling, from the pf352f point case). It costs a
+  write only after a reset, never on the normal path. The states: `open` (running, or a segment kept at
+  a point), `kept`, `rolled-back`, `ended-at-reset`.
 - **PHP's own transactions** inside a frame are savepoints of it. A PHP `ROLLBACK` undoes only its part,
   and the frame stays open with `active` still 1 (a mutant that missed this survived, so it has its
   own test).
@@ -73,12 +79,14 @@ AUTOINCREMENT, so a ROLLED-BACK insert's id IS reused by the next insert.
 ## What the client sees (ruling (iii))
 
 - On a write-loss failure, the front Worker asks the object's NEW isolate `/_frame?id=<request id>`. It
-  is one subrequest, on that path only. `/_frame` is refused to clients (404).
+  is one subrequest, on that path only. `/_frame` is refused to clients (404); a spike-token holder may
+  read it. The object answers it before its public-origin guard: it needs no origin (pf352f at `ebb62f5`
+  got 500 "missing x-wp-public-origin" on every probe, so a proven rollback still got today's message).
 - Only `rolled-back` with 0 commit points PROVES nothing was kept. The client then gets a 500 with
   `x-write-loss: rolled-back`, `x-write-undone: <rows>`, and "The request did not complete. Nothing was
   saved. You can try again." JSON for REST and Store API clients.
-- Anything else (unknown, open, kept, or rolled back after a commit point) gets today's "some changes may
-  have been saved; check before you try again".
+- Anything else (unknown, open, kept, ended-at-reset, or rolled back after a commit point) gets today's
+  "some changes may have been saved; check before you try again".
 - **Double posts:**
   - WordPress nonces are not stored, so a retry is valid and applies once;
   - the block editor does not retry by itself, and autosave is an upsert;

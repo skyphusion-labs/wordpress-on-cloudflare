@@ -164,6 +164,16 @@ export function createUndoLog({ stats, objectCacheDrop = () => {}, log = () => {
 		frameRow(db, armedReq, 'open');
 		own(db.exec('DELETE FROM _wp_frame WHERE req NOT IN (SELECT req FROM _wp_frame ORDER BY t DESC LIMIT ?)', FRAME_HISTORY));
 	}
+	// At recovery, no request of THIS isolate runs yet, so a frame row still 'open' belongs to a request a dead
+	// isolate was running: one killed after a commit point with nothing active since (the lead's ruling,
+	// pf352f point case). It gets 'ended-at-reset': a write only after a reset, never on the normal path.
+	function relabelEnded(db) {
+		try {
+			return own(db.exec("UPDATE _wp_frame SET state = 'ended-at-reset' WHERE state = 'open'")).rowsWritten || 0;
+		} catch {
+			return 0; // frames were never on here
+		}
+	}
 	// Close the frame KEPT: its rows stay, the log goes, deferred work runs.
 	function frameKeep(db, state) {
 		if (txnFrames) txnFrames = txnFrames.map((f) => ({ ...f, seq: 0 })); // a PHP txn spanning a commit point keeps what came before it
@@ -344,7 +354,8 @@ export function createUndoLog({ stats, objectCacheDrop = () => {}, log = () => {
 				return null; // no undo tables yet: no transaction or frame was ever opened
 			}
 			if (!active) {
-				log({ m: 'frame-recover', active: 0, tables: true, frames: framesOn() });
+				const relabeled = relabelEnded(db);
+				log({ m: 'frame-recover', active: 0, tables: true, frames: framesOn(), relabeled });
 				return null;
 			}
 			const n = undoTo(db, storage, 0);
@@ -352,7 +363,7 @@ export function createUndoLog({ stats, objectCacheDrop = () => {}, log = () => {
 			txnFrames = null;
 			let req = null;
 			try {
-				const r = [...db.exec("SELECT req FROM _wp_frame WHERE state = 'open' ORDER BY t DESC LIMIT 1").raw()];
+				const r = [...db.exec("SELECT req FROM _wp_frame WHERE state = 'open' ORDER BY t DESC, rowid DESC LIMIT 1").raw()];
 				if (r.length) {
 					req = r[0][0];
 					own(db.exec("UPDATE _wp_frame SET state = 'rolled-back', undone = ? WHERE req = ?", n, req));
@@ -360,8 +371,9 @@ export function createUndoLog({ stats, objectCacheDrop = () => {}, log = () => {
 			} catch {
 				// frames were never on here
 			}
+			const relabeled = relabelEnded(db);
 			log({ m: 'txn', recovered: true, undone: n, req });
-			log({ m: 'frame-recover', active: 1, tables: true, frames: framesOn(), undone: n, req });
+			log({ m: 'frame-recover', active: 1, tables: true, frames: framesOn(), undone: n, req, relabeled });
 			return { undone: n, req };
 		},
 		/** The outcome of a request, for the Worker's /_frame probe: null when unknown. */
