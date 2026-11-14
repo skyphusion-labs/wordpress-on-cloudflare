@@ -7,6 +7,8 @@ The data behind [docs/admin-memory-matrix.md](../../../../docs/admin-memory-matr
 | `a-in-do-pfa-do-joan.csv` | A with PHP in a Durable Object, 210 requests (the 7-screen round, 10 rounds at +0, +20 and +60 min) | `tools/admin-round.py`, then `tools/to-csv.py` |
 | `hostlesswp-hwp504.csv` | HostlessWP v0.1.1 (`739e8e7`), 210 requests, the same round, with the `x-hostlesswp` fields per request | the same |
 | `b-dosql-arena-ab-pf394a.csv` | b-dosql, `LAZY_ARENA` off (abA1, abA2) and on (abB1, abB2), 405 requests, plus the failed first try of A1 (abA1-loginfail) | Rollins's `measure394.py pnrest` (#537, frozen copy sha256 `633dcb16c0f0`), then `tools/ab-to-csv.py` |
+| `b-dosql-566fix-pf394a.csv` | b-dosql on the #566 fix (`c5af3c8d8229-wooprimed`), 210 requests, the 7-screen round at +0, +20 and +60 min, the cron held | `tools/admin-round.py`, then `tools/to-csv.py` |
+| `b-dosql-566ctl-pf394a.csv` | the same round on the control, the build before #571 (`6ef17dda850b-wooprimed`), 210 requests | the same |
 | `graphql/m4-pfa-m3-joan.json` | Cloudflare GraphQL, A with PHP in the Worker, 08:21 to 09:27Z | the lead's read: `workersInvocationsAdaptive`, filter `scriptName` and the window |
 | `graphql/do-activation.json` | the A-in-DO WooCommerce activation, 09:37 to 09:39Z | `workersInvocationsAdaptive` and `durableObjectsInvocationsAdaptiveGroups`, the same filter |
 | `graphql/do-plus0.json`, `do-plus20.json`, `do-plus60.json` | A with PHP in a DO, per window | the same two datasets |
@@ -23,6 +25,7 @@ Each GraphQL file is the full API answer, with the query (`_query`, the account 
   - `run`, `file` (the window: `*-plus0`, `*-plus20`, `*-plus60`), `t_utc`, `round`, `screen`, `method`, `status` (`SKIP-no-form` is a profile save not sent, because its form GET died);
   - `ms`, `x_isolate_retry`, `x_write_loss`, `x_isolate_reset`, `wasm1_mib` (`x-perf`, b-dosql only), `saved_and_read_back` (profile save: 1 if the marker read back);
   - `hwp_*` (from `x-hostlesswp`: `cold`, `phpMs`, `queries`, `dbMs`, `wasmMB`, `served`, `fetches`), and `err_len` (the body length of a 5xx).
+  - the two `b-dosql-566*` CSVs add two last columns: `x_runtime_recycled` (`memory` when this request left the wasm heap over the recycle line, so its runtime was dropped after it; `spikes/b2-wordpress/index.js`) and `boot` (1 when the request booted PHP). The older CSVs end at `err_len`.
 - `b-dosql-arena-ab-pf394a.csv`:
   - `arm`, `arena`, `t_utc`, `phase`, `label` (`post-new`, `rest-page`, `login`), `method`, `status`, `ms`, `boot`;
   - `x_isolate_reset`, `x_write_loss`, `wasm0_mib`, `wasm1_mib`, `inflates`, `reinflates`, `rest_readback_state` (`found` or `absent`), `rest_readback_ms`.
