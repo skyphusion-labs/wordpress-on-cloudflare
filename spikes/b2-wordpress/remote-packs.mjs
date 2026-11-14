@@ -48,6 +48,8 @@ export function createRemotePacks({ index, fetchPack, parse, stats, cap = REMOTE
 	let heldBytes = 0;
 	let heldMax = 0;
 	let lastHeldMax = 0;
+	const distinct = new Set(); // packs fetched in this request: rfN minus this is the refetch (thrash) count
+	let lastDistinct = 0;
 	const pending = new Map(); // packNo -> promise of the fetch in flight
 	const failed = new Set(); // packNo that failed in this request
 	let reqN = 0;
@@ -85,6 +87,7 @@ export function createRemotePacks({ index, fetchPack, parse, stats, cap = REMOTE
 		}
 		reqN++;
 		stats.rfN++;
+		distinct.add(packNo);
 		const pk = index.packs[packNo];
 		const t = Date.now();
 		const p = (async () => {
@@ -133,6 +136,8 @@ export function createRemotePacks({ index, fetchPack, parse, stats, cap = REMOTE
 			heldBytes = 0;
 			lastHeldMax = heldMax;
 			heldMax = 0;
+			lastDistinct = distinct.size;
+			distinct.clear();
 			failed.clear();
 			reqN = 0;
 			cappedLogged = false;
@@ -140,5 +145,7 @@ export function createRemotePacks({ index, fetchPack, parse, stats, cap = REMOTE
 		heldPacks: () => held.size,
 		// The high-water of held pack bytes in the request that ended last (x-perf rfHeldKiB).
 		lastHeldMax: () => lastHeldMax,
+		// Distinct packs fetched in the request that ended last (x-perf rfPacks).
+		lastDistinct: () => lastDistinct,
 	};
 }

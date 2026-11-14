@@ -86,3 +86,14 @@ test('the per-request cap counts refetches too, and resets with the request', as
 	await open(r, 'f2');
 	assert.equal(stats.rfN, 3);
 });
+
+test('distinct packs per request tell thrash from spread (x-perf rfPacks)', async () => {
+	const { r, stats } = make(2000);
+	for (const f of ['f0', 'f1', 'f2', 'f0']) await open(r, f);
+	r.endRequest();
+	assert.equal(stats.rfN, 4, 'four fetches');
+	assert.equal(r.lastDistinct(), 3, 'of three distinct packs: one refetch, the thrash');
+	await open(r, 'f1');
+	r.endRequest();
+	assert.equal(r.lastDistinct(), 1, 'a new request counts from 0');
+});

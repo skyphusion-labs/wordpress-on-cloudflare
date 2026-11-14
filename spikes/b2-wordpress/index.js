@@ -3625,8 +3625,9 @@ async function handle(req, env, url, spikeOk, maxBody, ctx) {
 					// #563: remote OPcache pack fetches this request (each one is a subrequest), their KiB and ms,
 					// the failed ones (a clean miss: OPcache compiled from source), the opens past the cap, and
 					// the high-water of held packs (after LRU eviction; a dropped pack is garbage until V8
-					// collects it, which /_headroom measures, not this field).
-					...(OPCACHE_REMOTE ? { rfN: stats.rfN - start.rfN, rfKiB: Math.round((stats.rfBytes - start.rfBytes) / 1024), rfMs: stats.rfMs - start.rfMs, rfFail: stats.rfFail - start.rfFail, rfCapped: stats.rfCapped - start.rfCapped, rfHeldKiB: remotePacks ? Math.round(remotePacks.lastHeldMax() / 1024) : 0 } : {}),
+					// collects it, which /_headroom measures, not this field), and the DISTINCT packs fetched:
+					// rfN minus rfPacks is the refetch count, the held budget thrashing.
+					...(OPCACHE_REMOTE ? { rfN: stats.rfN - start.rfN, rfKiB: Math.round((stats.rfBytes - start.rfBytes) / 1024), rfMs: stats.rfMs - start.rfMs, rfFail: stats.rfFail - start.rfFail, rfCapped: stats.rfCapped - start.rfCapped, rfHeldKiB: remotePacks ? Math.round(remotePacks.lastHeldMax() / 1024) : 0, rfPacks: remotePacks ? remotePacks.lastDistinct() : 0 } : {}),
 					...(ledgerActive ? { mem: ledgerSnapshot('end') } : {}), // #394: the isolate memory ledger
 					bytes: r.bytes.length,
 					httpCalls: stats.httpCalls - start.httpCalls,
